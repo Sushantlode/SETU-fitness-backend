@@ -19,6 +19,7 @@ import motivationsRouter from "./routes/motivations.js";
 import imagesRouter from "./routes/images.js";
 import workoutRouter from "./routes/workout.js";
 import googlefitRouter from "./routes/googlefit.js";
+import nutritionRouter from "./routes/nutrition.js";
 
 
 export const app = express();
@@ -32,13 +33,38 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: "2mb" }));
+// Configure body parser with better error handling
+app.use(express.json({
+  limit: "2mb",
+  strict: false, // Allow single values and other non-object JSON
+  verify: (req, res, buf, encoding) => {
+    try {
+      JSON.parse(buf);
+    } catch (e) {
+      throw new Error('Invalid JSON in request body');
+    }
+  }
+}));
+
+// Custom JSON error handler
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    return res.status(400).json({
+      hasError: true,
+      message: 'Invalid JSON in request body',
+      details: 'Please ensure your JSON is properly formatted with double quotes for property names'
+    });
+  }
+  next();
+});
+
 app.use(morgan("dev"));
 
-// Public
+// Public routes
 app.use("/health", healthRouter);
+app.use("/nutrition", nutritionRouter);
 
-// Protected
+// Protected routes (require authentication)
 app.use(authenticateJWT);
 app.use("/profiles", profilesRouter);
 app.use("/hydration", hydrationRouter);

@@ -1,10 +1,58 @@
 import { pool } from "../db/pool.js";
 export async function list(req, res, next) {
   try {
-    const { rows } = await pool.query(
-      "SELECT id, title, benefit, from_item, to_item, image_s3_key, is_public, created_at FROM ftn_swaps WHERE is_public=TRUE ORDER BY created_at DESC LIMIT 200"
-    );
-    res.json({ hasError: false, data: rows });
+    const { category } = req.query;
+    
+    let query = `
+      SELECT id, title, benefit, from_item, to_item, 
+             image_s3_key, is_public, category, created_at 
+      FROM ftn_swaps 
+      WHERE is_public = TRUE
+    `;
+    
+    const queryParams = [];
+    
+    if (category) {
+      query += ` AND LOWER(category) = LOWER($1)`;
+      queryParams.push(category);
+    }
+    
+    query += ` ORDER BY created_at DESC LIMIT 200`;
+    
+    const { rows } = await pool.query(query, queryParams);
+    
+    // If no category filter, group by category for the frontend
+    const response = { hasError: false };
+    
+    if (!category) {
+      const categories = {};
+      
+      // Default categories
+      const defaultCategories = [
+        'beverage', 'breads', 'snacks', 'breakfast', 
+        'lunch', 'dinner', 'desserts', 'sauces'
+      ];
+      
+      // Initialize with empty arrays
+      defaultCategories.forEach(cat => {
+        categories[cat] = [];
+      });
+      
+      // Group swaps by category
+      rows.forEach(swap => {
+        const cat = (swap.category || 'other').toLowerCase();
+        if (!categories[cat]) {
+          categories[cat] = [];
+        }
+        categories[cat].push(swap);
+      });
+      
+      response.data = categories;
+    } else {
+      response.data = rows;
+    }
+    
+    res.json(response);
   } catch (e) {
     next(e);
   }
@@ -20,6 +68,7 @@ export async function createOrUpdatePublic(req, res, next) {
       benefit = null,
       image_s3_key = null,
       is_public = true,
+      category = null,
     } = req.body;
     const owner_user_id = req.user_id;
     if (!title && !id)
@@ -28,7 +77,17 @@ export async function createOrUpdatePublic(req, res, next) {
         .json({ hasError: true, message: "title required for create" });
     if (id) {
       const { rows } = await pool.query(
-        `UPDATE ftn_swaps SET title=COALESCE($2,title),description=COALESCE($3,description),from_item=COALESCE($4,from_item),to_item=COALESCE($5,to_item),benefit=COALESCE($6,benefit),image_s3_key=COALESCE($7,image_s3_key),is_public=COALESCE($8,is_public) WHERE id=$1 RETURNING *`,
+        `UPDATE ftn_swaps 
+         SET title=COALESCE($2,title),
+             description=COALESCE($3,description),
+             from_item=COALESCE($4,from_item),
+             to_item=COALESCE($5,to_item),
+             benefit=COALESCE($6,benefit),
+             image_s3_key=COALESCE($7,image_s3_key),
+             is_public=COALESCE($8,is_public),
+             category=COALESCE($9,category)
+         WHERE id=$1 
+         RETURNING *`,
         [
           id,
           title,
@@ -38,12 +97,16 @@ export async function createOrUpdatePublic(req, res, next) {
           benefit,
           image_s3_key,
           is_public,
+          category
         ]
       );
       return res.json({ hasError: false, data: rows[0] || null });
     } else {
       const { rows } = await pool.query(
-        `INSERT INTO ftn_swaps (title, description, from_item, to_item, benefit, image_s3_key, is_public, owner_user_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+        `INSERT INTO ftn_swaps 
+          (title, description, from_item, to_item, benefit, image_s3_key, is_public, owner_user_id, category) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
+         RETURNING *`,
         [
           title,
           description,
@@ -53,6 +116,7 @@ export async function createOrUpdatePublic(req, res, next) {
           image_s3_key,
           is_public,
           owner_user_id,
+          category
         ]
       );
       return res.json({ hasError: false, data: rows[0] });

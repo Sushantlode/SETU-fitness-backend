@@ -1,10 +1,56 @@
 import { pool } from "../db/pool.js";
 export async function list(req, res, next) {
   try {
-    const { rows } = await pool.query(
-      "SELECT id, user_id, title, image_s3_key, servings, total_time_min, created_at FROM ftn_recipes ORDER BY created_at DESC LIMIT 200"
-    );
-    res.json({ hasError: false, data: rows });
+    const { mealType } = req.query;
+    let query = `
+      SELECT id, user_id, title, description, image_s3_key, 
+             servings, total_time_min, meal_type, created_at 
+      FROM ftn_recipes 
+      WHERE 1=1
+    `;
+    
+    const queryParams = [];
+    
+    if (mealType) {
+      query += ` AND LOWER(meal_type) = LOWER($1)`;
+      queryParams.push(mealType);
+    }
+    
+    query += ` ORDER BY created_at DESC LIMIT 200`;
+    
+    const { rows } = await pool.query(query, queryParams);
+    
+    // If no meal type filter or no results, return default recipes based on time of day
+    if ((!mealType || rows.length === 0) && req.query.autoSuggest !== 'false') {
+      const hour = new Date().getHours();
+      let suggestedMealType = 'lunch';
+      
+      if (hour >= 5 && hour < 10) suggestedMealType = 'breakfast';
+      else if (hour >= 10 && hour < 15) suggestedMealType = 'lunch';
+      else suggestedMealType = 'dinner';
+      
+      const { rows: suggestedRows } = await pool.query(
+        `SELECT id, user_id, title, description, image_s3_key, 
+                servings, total_time_min, meal_type, created_at 
+         FROM ftn_recipes 
+         WHERE LOWER(meal_type) = $1 
+         ORDER BY RANDOM() 
+         LIMIT 3`,
+        [suggestedMealType]
+      );
+      
+      return res.json({ 
+        hasError: false, 
+        data: suggestedRows,
+        suggestedMealType
+      });
+    }
+    
+    res.json({ 
+      hasError: false, 
+      data: rows,
+      suggestedMealType: mealType || null
+    });
   } catch (e) {
     next(e);
   }
@@ -18,12 +64,22 @@ export async function create(req, res, next) {
       total_time_min = null,
       servings = null,
       image_s3_key = null,
+      meal_type = null,
     } = req.body;
-    if (!title)
+    
+    if (!title) {
       return res
         .status(400)
         .json({ hasError: true, message: "title is required" });
-    const q = `INSERT INTO ftn_recipes (user_id, title, description, total_time_min, servings, image_s3_key) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`;
+    }
+    
+    const q = `
+      INSERT INTO ftn_recipes 
+        (user_id, title, description, total_time_min, servings, image_s3_key, meal_type) 
+      VALUES ($1, $2, $3, $4, $5, $6, $7) 
+      RETURNING *
+    `;
+    
     const { rows } = await pool.query(q, [
       user_id,
       title,
@@ -31,7 +87,9 @@ export async function create(req, res, next) {
       total_time_min,
       servings,
       image_s3_key,
+      meal_type
     ]);
+    
     res.json({ hasError: false, data: rows[0] });
   } catch (e) {
     next(e);
