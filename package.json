@@ -1,0 +1,24 @@
+{
+  "name": "fitness-backend",
+  "version": "2.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch server.js",
+    "start": "node server.js",
+    "db:setup": "psql -f src/sql/schema.sql",
+    "db:seed": "psql -v user_id=1 -f src/sql/fitness_seed.sql",
+    "auth:debug": "node scripts/login_and_decode.cjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.637.0",
+    "@aws-sdk/s3-request-presigner": "^3.637.0",
+    "axios": "^1.11.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "googleapis": "^157.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "pg": "^8.12.0"
+  }
+}

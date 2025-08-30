@@ -1,0 +1,10 @@
+import { Router } from "express";
+import * as ctrl from "../controllers/swaps.js";
+const r = Router();
+r.get("/", ctrl.list);
+r.post("/", ctrl.createOrUpdatePublic);
+r.put("/:id", ctrl.createOrUpdatePublic);
+r.delete("/:id", ctrl.deletePublic);
+r.post("/save", ctrl.saveForUser);
+r.get("/saved", ctrl.listSaved);
+export default r;

@@ -1,0 +1,13 @@
+import { Router } from "express";
+import * as ctrl from "../controllers/meals.js";
+const r = Router();
+r.get("/", ctrl.list);
+r.post("/", ctrl.create);
+r.get("/:id", ctrl.getOne);
+r.put("/:id", ctrl.update);
+r.delete("/:id", ctrl.remove);
+r.post("/:id/items", ctrl.addItem);
+r.get("/:id/items", ctrl.listItems);
+r.put("/:id/items/:item_id", ctrl.updateItem);
+r.delete("/:id/items/:item_id", ctrl.removeItem);
+export default r;

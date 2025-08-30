@@ -1,0 +1,17 @@
+import { Router } from "express";
+import * as ctrl from "../controllers/mealPlans.js";
+const r = Router();
+r.get("/", ctrl.listPlans);
+r.post("/", ctrl.createPlan);
+r.get("/:plan_id", ctrl.getPlan);
+r.put("/:plan_id", ctrl.updatePlan);
+r.delete("/:plan_id", ctrl.deletePlan);
+r.get("/:plan_id/days", ctrl.listDays);
+r.post("/:plan_id/days", ctrl.addDay);
+r.put("/days/:day_id", ctrl.updateDay);
+r.delete("/days/:day_id", ctrl.deleteDay);
+r.get("/days/:day_id/slots", ctrl.listSlots);
+r.post("/days/:day_id/slots", ctrl.addSlot);
+r.put("/days/:day_id/slots/:slot_id", ctrl.updateSlot);
+r.delete("/days/:day_id/slots/:slot_id", ctrl.deleteSlot);
+export default r;
