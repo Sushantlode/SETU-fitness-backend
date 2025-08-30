@@ -28,10 +28,10 @@ const recommendedFromBmi = (weightKg, bmi) => {
   return Math.max(1200, Math.min(6000, raw)); // clamp
 };
 
-/** IMPORTANT: using ftn_profile (singular) as requested */
+// PROFILE: ftn_profiles (plural)
 async function getProfile(user_id, client = pool) {
   const { rows } = await client.query(
-    `SELECT id, weight_kg, height_cm, bmi
+    `SELECT id, user_id, weight_kg, height_cm, bmi
        FROM ftn_profiles
       WHERE user_id = $1
       LIMIT 1`,
@@ -40,6 +40,7 @@ async function getProfile(user_id, client = pool) {
   return rows[0] || null;
 }
 
+// GOAL: active
 async function getActiveGoalMl(user_id, client = pool) {
   const { rows } = await client.query(
     `SELECT daily_ml::int AS ml
@@ -52,7 +53,7 @@ async function getActiveGoalMl(user_id, client = pool) {
   return rows[0]?.ml || 0;
 }
 
-/** Ensure the daily row exists and always reflects the latest goal for that day */
+/** Ensure/refresh daily row with current goal */
 async function ensureOrUpdateDaily(user_id, day, goal_ml, client) {
   await client.query(
     `INSERT INTO ftn_daily_water_intake(user_id, day, goal_ml)
@@ -98,6 +99,23 @@ async function recomputeDaily(user_id, day, client) {
   return { ...rows[0], percent_consumed: pct };
 }
 
+/** Require profile for hydration features (used inside controllers) */
+async function assertProfileOr404(user_id, res, client = pool) {
+  const p = await getProfile(user_id, client);
+  if (!p) {
+    res.status(404).json({ hasError: true, message: "Profile not found" });
+    return null;
+  }
+  return p;
+}
+
+/** Reset this user's hydration data completely */
+export async function resetHydrationForUser(user_id, client) {
+  await client.query(`DELETE FROM ftn_water_logs WHERE user_id = $1`, [user_id]);
+  await client.query(`DELETE FROM ftn_daily_water_intake WHERE user_id = $1`, [user_id]);
+  await client.query(`DELETE FROM ftn_hydration_goals WHERE user_id = $1`, [user_id]);
+}
+
 /* ========== controllers ========== */
 
 // POST /hydration/body-profile/upsert
@@ -106,9 +124,8 @@ export async function upsertBodyProfileAndGoal(req, res, next) {
   try {
     const user_id = String(req.user_id);
 
-    // must have a profile
-    const p = await getProfile(user_id, client);
-    if (!p) return res.status(404).json({ hasError: true, message: "Profile not found" });
+    const p = await assertProfileOr404(user_id, res, client);
+    if (!p) return;
 
     let bmi = p.bmi;
     if (bmi == null || !Number.isFinite(Number(bmi))) bmi = computeBmi(p.weight_kg, p.height_cm);
@@ -118,7 +135,6 @@ export async function upsertBodyProfileAndGoal(req, res, next) {
 
     await client.query("BEGIN");
 
-    // only one active goal
     await client.query(
       `UPDATE ftn_hydration_goals SET is_active = FALSE, updated_at = NOW()
         WHERE user_id = $1 AND is_active = TRUE`,
@@ -127,7 +143,8 @@ export async function upsertBodyProfileAndGoal(req, res, next) {
 
     const { rows: goalRows } = await client.query(
       `INSERT INTO ftn_hydration_goals(user_id, daily_ml, is_active, created_at, updated_at)
-       VALUES ($1, $2, TRUE, NOW(), NOW()) RETURNING id, user_id, daily_ml, is_active, created_at, updated_at`,
+       VALUES ($1, $2, TRUE, NOW(), NOW())
+       RETURNING id, user_id, daily_ml, is_active, created_at, updated_at`,
       [user_id, daily_ml]
     );
 
@@ -163,8 +180,8 @@ export async function getGoal(req, res, next) {
   try {
     const user_id = String(req.user_id);
 
-    const p = await getProfile(user_id);
-    if (!p) return res.status(404).json({ hasError: true, message: "Profile not found" });
+    const p = await assertProfileOr404(user_id, res);
+    if (!p) return;
 
     const activeMl = await getActiveGoalMl(user_id);
     if (!pos(activeMl)) {
@@ -197,9 +214,8 @@ export async function setGoal(req, res, next) {
   try {
     const user_id = String(req.user_id);
 
-    // require profile first
-    const p = await getProfile(user_id, client);
-    if (!p) return res.status(404).json({ hasError: true, message: "Profile not found" });
+    const p = await assertProfileOr404(user_id, res, client);
+    if (!p) return;
 
     const daily_ml = n(req.body?.daily_ml);
     if (!pos(daily_ml)) return res.status(400).json({ hasError: true, message: "daily_ml must be > 0" });
@@ -238,10 +254,13 @@ export async function addLog(req, res, next) {
   const client = await pool.connect();
   try {
     const user_id = String(req.user_id);
+
+    const p = await assertProfileOr404(user_id, res, client);
+    if (!p) return;
+
     const amount_ml = n(req.body?.amount_ml);
     if (!pos(amount_ml)) return res.status(400).json({ hasError: true, message: "amount_ml must be > 0" });
 
-    // require active goal
     const goal_ml = await getActiveGoalMl(user_id, client);
     if (!pos(goal_ml)) return res.status(404).json({ hasError: true, message: "No active goal set" });
 
@@ -285,6 +304,10 @@ export async function addLogsBatch(req, res, next) {
   const client = await pool.connect();
   try {
     const user_id = String(req.user_id);
+
+    const p = await assertProfileOr404(user_id, res, client);
+    if (!p) return;
+
     const source = req.body?.source ?? null;
     const amounts = (Array.isArray(req.body?.amounts) ? req.body.amounts.map(n) : []);
     const ats = Array.isArray(req.body?.logged_ats) ? req.body.logged_ats : null;
@@ -296,7 +319,6 @@ export async function addLogsBatch(req, res, next) {
       return res.status(400).json({ hasError: true, message: "logged_ats length must match amounts" });
     }
 
-    // require active goal
     const goal_ml = await getActiveGoalMl(user_id, client);
     if (!pos(goal_ml)) return res.status(404).json({ hasError: true, message: "No active goal set" });
 
@@ -349,7 +371,9 @@ export async function getTodayLogs(req, res, next) {
   try {
     const user_id = String(req.user_id);
 
-    // must have active goal to show water features
+    const p = await assertProfileOr404(user_id, res);
+    if (!p) return;
+
     const goal_ml = await getActiveGoalMl(user_id);
     if (!pos(goal_ml)) return res.status(404).json({ hasError: true, message: "No active goal set" });
 
@@ -371,7 +395,9 @@ export async function undoLastLog(req, res, next) {
   try {
     const user_id = String(req.user_id);
 
-    // require active goal
+    const p = await assertProfileOr404(user_id, res, client);
+    if (!p) return;
+
     const goal_ml = await getActiveGoalMl(user_id, client);
     if (!pos(goal_ml)) return res.status(404).json({ hasError: true, message: "No active goal set" });
 
@@ -416,13 +442,14 @@ export async function getConsumedToday(req, res, next) {
   try {
     const user_id = String(req.user_id);
 
-    // require active goal before showing consumption UI
+    const p = await assertProfileOr404(user_id, res);
+    if (!p) return;
+
     const activeGoal = await getActiveGoalMl(user_id);
     if (!pos(activeGoal)) return res.status(404).json({ hasError: true, message: "No active goal set" });
 
     const d = today();
 
-    // timeline
     const { rows: logs } = await pool.query(
       `SELECT
          amount_ml::int AS consumed_ml,
@@ -433,7 +460,6 @@ export async function getConsumedToday(req, res, next) {
       [user_id, d]
     );
 
-    // strict: use the day’s goal row
     const { rows: daily } = await pool.query(
       `SELECT goal_ml::int AS goal_ml, consumed_ml::int AS consumed_ml, COALESCE(met_goal, FALSE) AS met_goal
          FROM ftn_daily_water_intake
@@ -467,7 +493,9 @@ export async function getDailyRowsByBody(req, res, next) {
   try {
     const user_id = String(req.user_id);
 
-    // require active goal to show history; if you want to show blank history even without goal, remove this block
+    const p = await assertProfileOr404(user_id, res);
+    if (!p) return;
+
     const activeGoal = await getActiveGoalMl(user_id);
     if (!pos(activeGoal)) return res.status(404).json({ hasError: true, message: "No active goal set" });
 
@@ -488,4 +516,26 @@ export async function getDailyRowsByBody(req, res, next) {
 
     return res.json({ hasError: false, data: { start, end, days: rows } });
   } catch (e) { next(e); }
+}
+
+// POST /hydration/reset — wipe all hydration data for this user
+export async function resetHydration(req, res, next) {
+  const client = await pool.connect();
+  try {
+    const user_id = String(req.user_id);
+
+    const p = await assertProfileOr404(user_id, res, client);
+    if (!p) return;
+
+    await client.query("BEGIN");
+    await resetHydrationForUser(user_id, client);
+    await client.query("COMMIT");
+
+    return res.status(200).json({ hasError: false, message: "Hydration data reset" });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    next(e);
+  } finally {
+    client.release();
+  }
 }
