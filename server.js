@@ -3,6 +3,8 @@ import dotenv from "dotenv";
 dotenv.config({ path: process.env.ENV_PATH || ".env" });
 import hydrationRouter from "./src/routes/hydration.js";
 app.use("/hydration", hydrationRouter);
+import mealsRouter from "./src/routes/meals.js";
+app.use("/meals", mealsRouter);
 
 import { app } from "./src/app.js";
 

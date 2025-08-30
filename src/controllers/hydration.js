@@ -28,6 +28,7 @@ const recommendedFromBmi = (weightKg, bmi) => {
   return Math.max(1200, Math.min(6000, raw)); // clamp
 };
 
+/** IMPORTANT: using ftn_profile (singular) as requested */
 async function getProfile(user_id, client = pool) {
   const { rows } = await client.query(
     `SELECT id, weight_kg, height_cm, bmi
@@ -51,17 +52,19 @@ async function getActiveGoalMl(user_id, client = pool) {
   return rows[0]?.ml || 0;
 }
 
-async function ensureDaily(user_id, day, goal_ml, client) {
+/** Ensure the daily row exists and always reflects the latest goal for that day */
+async function ensureOrUpdateDaily(user_id, day, goal_ml, client) {
   await client.query(
     `INSERT INTO ftn_daily_water_intake(user_id, day, goal_ml)
      VALUES ($1, $2, $3)
-     ON CONFLICT (user_id, day) DO NOTHING`,
+     ON CONFLICT (user_id, day)
+     DO UPDATE SET goal_ml = EXCLUDED.goal_ml, updated_at = NOW()`,
     [user_id, day, goal_ml]
   );
 }
 
 async function recomputeDaily(user_id, day, client) {
-  const [{ rows: sumR }, { rows: goalR }] = await Promise.all([
+  const [{ rows: sumR }, { rows: dailyR }] = await Promise.all([
     client.query(
       `SELECT COALESCE(SUM(amount_ml),0)::int AS raw
          FROM ftn_water_logs
@@ -74,11 +77,12 @@ async function recomputeDaily(user_id, day, client) {
         WHERE user_id = $1 AND day = $2::date
         LIMIT 1`,
       [user_id, day]
-    )
+    ),
   ]);
 
   const raw = sumR[0].raw;
-  const goal = goalR[0]?.goal_ml || 0;
+  const goal = dailyR[0]?.goal_ml || 0;
+
   const clamped = goal > 0 ? Math.min(raw, goal) : raw;
   const met = goal > 0 && raw >= goal;
   const pct = goal > 0 ? Math.min(Math.round((raw / goal) * 100), 100) : 0;
@@ -94,13 +98,15 @@ async function recomputeDaily(user_id, day, client) {
   return { ...rows[0], percent_consumed: pct };
 }
 
-/* ========== controllers (NAMED EXPORTS) ========== */
+/* ========== controllers ========== */
 
 // POST /hydration/body-profile/upsert
 export async function upsertBodyProfileAndGoal(req, res, next) {
   const client = await pool.connect();
   try {
     const user_id = String(req.user_id);
+
+    // must have a profile
     const p = await getProfile(user_id, client);
     if (!p) return res.status(404).json({ hasError: true, message: "Profile not found" });
 
@@ -111,23 +117,26 @@ export async function upsertBodyProfileAndGoal(req, res, next) {
     const daily_ml = recommendedFromBmi(p.weight_kg, bmi);
 
     await client.query("BEGIN");
+
+    // only one active goal
     await client.query(
       `UPDATE ftn_hydration_goals SET is_active = FALSE, updated_at = NOW()
         WHERE user_id = $1 AND is_active = TRUE`,
       [user_id]
     );
+
     const { rows: goalRows } = await client.query(
       `INSERT INTO ftn_hydration_goals(user_id, daily_ml, is_active, created_at, updated_at)
-       VALUES ($1, $2, TRUE, NOW(), NOW()) RETURNING *`,
+       VALUES ($1, $2, TRUE, NOW(), NOW()) RETURNING id, user_id, daily_ml, is_active, created_at, updated_at`,
       [user_id, daily_ml]
     );
 
     const d = today();
-    await ensureDaily(user_id, d, daily_ml, client);
+    await ensureOrUpdateDaily(user_id, d, daily_ml, client);
     const todayRow = await recomputeDaily(user_id, d, client);
 
     await client.query("COMMIT");
-    res.json({
+    return res.json({
       hasError: false,
       data: {
         goal: goalRows[0],
@@ -137,19 +146,30 @@ export async function upsertBodyProfileAndGoal(req, res, next) {
           consumed_ml: todayRow.consumed_ml,
           percent_consumed: todayRow.percent_consumed,
           remaining_ml: Math.max(todayRow.goal_ml - todayRow.consumed_ml, 0),
-          met_goal: todayRow.met_goal
-        }
-      }
+          met_goal: todayRow.met_goal,
+        },
+      },
     });
-  } catch (e) { try { await client.query("ROLLBACK"); } catch {} ; next(e); }
-  finally { client.release(); }
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    next(e);
+  } finally {
+    client.release();
+  }
 }
 
 // GET /hydration/goal
 export async function getGoal(req, res, next) {
   try {
     const user_id = String(req.user_id);
-    const [activeMl, p] = await Promise.all([getActiveGoalMl(user_id), getProfile(user_id)]);
+
+    const p = await getProfile(user_id);
+    if (!p) return res.status(404).json({ hasError: true, message: "Profile not found" });
+
+    const activeMl = await getActiveGoalMl(user_id);
+    if (!pos(activeMl)) {
+      return res.status(404).json({ hasError: true, message: "No active goal set" });
+    }
 
     let bmi = p?.bmi;
     if ((bmi == null || !Number.isFinite(Number(bmi))) && p?.height_cm && p?.weight_kg) {
@@ -159,14 +179,14 @@ export async function getGoal(req, res, next) {
     const suggested_daily_ml =
       (p?.weight_kg && bmi != null) ? recommendedFromBmi(p.weight_kg, bmi) : null;
 
-    res.json({
+    return res.json({
       hasError: false,
       data: {
-        goal_ml: activeMl || null,
+        goal_ml: activeMl,
         profile_bmi: bmi ?? null,
         bmi_category: bmiCategory(bmi),
-        suggested_daily_ml
-      }
+        suggested_daily_ml,
+      },
     });
   } catch (e) { next(e); }
 }
@@ -176,6 +196,11 @@ export async function setGoal(req, res, next) {
   const client = await pool.connect();
   try {
     const user_id = String(req.user_id);
+
+    // require profile first
+    const p = await getProfile(user_id, client);
+    if (!p) return res.status(404).json({ hasError: true, message: "Profile not found" });
+
     const daily_ml = n(req.body?.daily_ml);
     if (!pos(daily_ml)) return res.status(400).json({ hasError: true, message: "daily_ml must be > 0" });
 
@@ -187,18 +212,23 @@ export async function setGoal(req, res, next) {
     );
     const { rows } = await client.query(
       `INSERT INTO ftn_hydration_goals(user_id, daily_ml, is_active, created_at, updated_at)
-       VALUES ($1, $2, TRUE, NOW(), NOW()) RETURNING *`,
+       VALUES ($1, $2, TRUE, NOW(), NOW())
+       RETURNING id, user_id, daily_ml, is_active, created_at, updated_at`,
       [user_id, daily_ml]
     );
 
     const d = today();
-    await ensureDaily(user_id, d, daily_ml, client);
+    await ensureOrUpdateDaily(user_id, d, daily_ml, client);
     await recomputeDaily(user_id, d, client);
 
     await client.query("COMMIT");
-    res.json({ hasError: false, data: rows[0] });
-  } catch (e) { try { await client.query("ROLLBACK"); } catch {} ; next(e); }
-  finally { client.release(); }
+    return res.json({ hasError: false, data: rows[0] });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    next(e);
+  } finally {
+    client.release();
+  }
 }
 
 // POST /hydration/logs
@@ -211,15 +241,16 @@ export async function addLog(req, res, next) {
     const amount_ml = n(req.body?.amount_ml);
     if (!pos(amount_ml)) return res.status(400).json({ hasError: true, message: "amount_ml must be > 0" });
 
+    // require active goal
+    const goal_ml = await getActiveGoalMl(user_id, client);
+    if (!pos(goal_ml)) return res.status(404).json({ hasError: true, message: "No active goal set" });
+
     const source = req.body?.source ?? null;
     const at = req.body?.logged_at || null;
     const d = (at ? String(at).slice(0, 10) : today());
 
-    const goal_ml = await getActiveGoalMl(user_id, client);
-    if (!pos(goal_ml)) return res.status(400).json({ hasError: true, message: "No active goal set" });
-
     await client.query("BEGIN");
-    await ensureDaily(user_id, d, goal_ml, client);
+    await ensureOrUpdateDaily(user_id, d, goal_ml, client);
 
     const { rows: ins } = await client.query(
       `INSERT INTO ftn_water_logs(user_id, logged_at, amount_ml, source, created_at)
@@ -231,7 +262,7 @@ export async function addLog(req, res, next) {
     const updated = await recomputeDaily(user_id, d, client);
     await client.query("COMMIT");
 
-    res.json({
+    return res.json({
       hasError: false,
       data: {
         inserted: ins[0],
@@ -240,11 +271,13 @@ export async function addLog(req, res, next) {
         consumed_ml: updated.consumed_ml,
         percent_consumed: updated.percent_consumed,
         remaining_ml: Math.max(updated.goal_ml - updated.consumed_ml, 0),
-        met_goal: updated.met_goal
-      }
+        met_goal: updated.met_goal,
+      },
     });
-  } catch (e) { try { await client.query("ROLLBACK"); } catch {} ; next(e); }
-  finally { client.release(); }
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    next(e);
+  } finally { client.release(); }
 }
 
 // POST /hydration/logs/batch
@@ -263,12 +296,14 @@ export async function addLogsBatch(req, res, next) {
       return res.status(400).json({ hasError: true, message: "logged_ats length must match amounts" });
     }
 
-    const d = today();
+    // require active goal
     const goal_ml = await getActiveGoalMl(user_id, client);
-    if (!pos(goal_ml)) return res.status(400).json({ hasError: true, message: "No active goal set" });
+    if (!pos(goal_ml)) return res.status(404).json({ hasError: true, message: "No active goal set" });
+
+    const d = today();
 
     await client.query("BEGIN");
-    await ensureDaily(user_id, d, goal_ml, client);
+    await ensureOrUpdateDaily(user_id, d, goal_ml, client);
 
     const params = [];
     const values = [];
@@ -291,7 +326,7 @@ export async function addLogsBatch(req, res, next) {
     const updated = await recomputeDaily(user_id, d, client);
     await client.query("COMMIT");
 
-    res.json({
+    return res.json({
       hasError: false,
       data: {
         inserted,
@@ -300,17 +335,24 @@ export async function addLogsBatch(req, res, next) {
         consumed_ml: updated.consumed_ml,
         percent_consumed: updated.percent_consumed,
         remaining_ml: Math.max(updated.goal_ml - updated.consumed_ml, 0),
-        met_goal: updated.met_goal
-      }
+        met_goal: updated.met_goal,
+      },
     });
-  } catch (e) { try { await client.query("ROLLBACK"); } catch {} ; next(e); }
-  finally { client.release(); }
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    next(e);
+  } finally { client.release(); }
 }
 
 // GET /hydration/logs/today
 export async function getTodayLogs(req, res, next) {
   try {
     const user_id = String(req.user_id);
+
+    // must have active goal to show water features
+    const goal_ml = await getActiveGoalMl(user_id);
+    if (!pos(goal_ml)) return res.status(404).json({ hasError: true, message: "No active goal set" });
+
     const d = today();
     const { rows } = await pool.query(
       `SELECT id, logged_at, amount_ml::int AS amount_ml, source, created_at
@@ -319,7 +361,7 @@ export async function getTodayLogs(req, res, next) {
         ORDER BY logged_at DESC`,
       [user_id, d]
     );
-    res.json({ hasError: false, data: rows });
+    return res.json({ hasError: false, data: rows });
   } catch (e) { next(e); }
 }
 
@@ -328,6 +370,11 @@ export async function undoLastLog(req, res, next) {
   const client = await pool.connect();
   try {
     const user_id = String(req.user_id);
+
+    // require active goal
+    const goal_ml = await getActiveGoalMl(user_id, client);
+    if (!pos(goal_ml)) return res.status(404).json({ hasError: true, message: "No active goal set" });
+
     const d = today();
 
     await client.query("BEGIN");
@@ -343,10 +390,11 @@ export async function undoLastLog(req, res, next) {
       return res.status(404).json({ hasError: true, message: "No logs today" });
     }
     await client.query(`DELETE FROM ftn_water_logs WHERE id = $1`, [last[0].id]);
+    await ensureOrUpdateDaily(user_id, d, goal_ml, client);
     const updated = await recomputeDaily(user_id, d, client);
     await client.query("COMMIT");
 
-    res.json({
+    return res.json({
       hasError: false,
       data: {
         day: d,
@@ -354,19 +402,27 @@ export async function undoLastLog(req, res, next) {
         consumed_ml: updated.consumed_ml,
         percent_consumed: updated.percent_consumed,
         remaining_ml: Math.max(updated.goal_ml - updated.consumed_ml, 0),
-        met_goal: updated.met_goal
-      }
+        met_goal: updated.met_goal,
+      },
     });
-  } catch (e) { try { await client.query("ROLLBACK"); } catch {} ; next(e); }
-  finally { client.release(); }
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    next(e);
+  } finally { client.release(); }
 }
 
 // GET /hydration/consumed/today
 export async function getConsumedToday(req, res, next) {
   try {
     const user_id = String(req.user_id);
+
+    // require active goal before showing consumption UI
+    const activeGoal = await getActiveGoalMl(user_id);
+    if (!pos(activeGoal)) return res.status(404).json({ hasError: true, message: "No active goal set" });
+
     const d = today();
 
+    // timeline
     const { rows: logs } = await pool.query(
       `SELECT
          amount_ml::int AS consumed_ml,
@@ -377,30 +433,31 @@ export async function getConsumedToday(req, res, next) {
       [user_id, d]
     );
 
-    const raw = logs.reduce((s, r) => s + (r.consumed_ml || 0), 0);
+    // strict: use the day’s goal row
     const { rows: daily } = await pool.query(
-      `SELECT goal_ml::int AS goal_ml, consumed_ml::int AS consumed_ml
+      `SELECT goal_ml::int AS goal_ml, consumed_ml::int AS consumed_ml, COALESCE(met_goal, FALSE) AS met_goal
          FROM ftn_daily_water_intake
         WHERE user_id = $1 AND day = $2::date
         LIMIT 1`,
       [user_id, d]
     );
 
-    const goal_ml = daily[0]?.goal_ml || (await getActiveGoalMl(user_id));
-    const clamped = goal_ml > 0 ? Math.min(raw, goal_ml) : raw;
-    const percent = goal_ml > 0 ? Math.min(Math.round((raw / goal_ml) * 100), 100) : 0;
-    const met = goal_ml > 0 && raw >= goal_ml;
+    if (!daily[0] || !pos(daily[0].goal_ml)) {
+      return res.status(404).json({ hasError: true, message: "No active goal set for today" });
+    }
 
-    res.json({
+    return res.json({
       hasError: false,
       data: {
         day: d,
-        goal_ml,
+        goal_ml: daily[0].goal_ml,
         added_water: logs,
-        total_consumed_ml: clamped,
-        percent_consumed: percent,
-        met_goal: met
-      }
+        total_consumed_ml: daily[0].consumed_ml ?? 0,
+        percent_consumed: daily[0].goal_ml > 0
+          ? Math.min(Math.round(((daily[0].consumed_ml ?? 0) / daily[0].goal_ml) * 100), 100)
+          : 0,
+        met_goal: daily[0].met_goal === true,
+      },
     });
   } catch (e) { next(e); }
 }
@@ -409,20 +466,26 @@ export async function getConsumedToday(req, res, next) {
 export async function getDailyRowsByBody(req, res, next) {
   try {
     const user_id = String(req.user_id);
-    const start = (req.body?.start && String(req.body.start).slice(0, 10)) || new Date(Date.now() - 13 * 86400000).toISOString().slice(0, 10);
+
+    // require active goal to show history; if you want to show blank history even without goal, remove this block
+    const activeGoal = await getActiveGoalMl(user_id);
+    if (!pos(activeGoal)) return res.status(404).json({ hasError: true, message: "No active goal set" });
+
+    const start = (req.body?.start && String(req.body.start).slice(0, 10))
+      || new Date(Date.now() - 13 * 86400000).toISOString().slice(0, 10);
     const end = (req.body?.end && String(req.body.end).slice(0, 10)) || today();
 
     const { rows } = await pool.query(
       `SELECT day,
               goal_ml::int     AS goal_ml,
               consumed_ml::int AS consumed_ml,
-              met_goal
+              COALESCE(met_goal, FALSE) AS met_goal
          FROM ftn_daily_water_intake
         WHERE user_id = $1 AND day BETWEEN $2::date AND $3::date
         ORDER BY day DESC`,
       [user_id, start, end]
     );
 
-    res.json({ hasError: false, data: { start, end, days: rows } });
+    return res.json({ hasError: false, data: { start, end, days: rows } });
   } catch (e) { next(e); }
 }
