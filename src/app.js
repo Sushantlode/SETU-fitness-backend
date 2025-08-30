@@ -20,7 +20,7 @@ import imagesRouter from "./routes/images.js";
 import workoutRouter from "./routes/workout.js";
 import googlefitRouter from "./routes/googlefit.js";
 import nutritionRouter from "./routes/nutrition.js";
-
+import foodRouter from "./routes/food.js";
 
 export const app = express();
 
@@ -63,6 +63,7 @@ app.use(morgan("dev"));
 // Public routes
 app.use("/health", healthRouter);
 app.use("/nutrition", nutritionRouter);
+app.use("/food", foodRouter);
 
 // Protected routes (require authentication)
 app.use(authenticateJWT);
