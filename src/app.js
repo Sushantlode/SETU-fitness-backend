@@ -5,7 +5,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 dotenv.config();
 
-import { authenticateJWT } from "./middleware/auth.js";
+import { authenticateJWT } from "./middleware/auth.js";  // Authentication middleware
 import healthRouter from "./routes/health.js";
 import profilesRouter from "./routes/profiles.js";
 import hydrationRouter from "./routes/hydration.js";
@@ -20,10 +20,11 @@ import imagesRouter from "./routes/images.js";
 import workoutRouter from "./routes/workout.js";
 import googlefitRouter from "./routes/googlefit.js";
 import nutritionRouter from "./routes/nutrition.js";
-import foodRouter from "./routes/food.js";
+import foodRouter from "./routes/food.js";  // Public route
 
 export const app = express();
 
+// CORS configuration
 app.use(
   cors({
     origin: true,
@@ -60,13 +61,13 @@ app.use((err, req, res, next) => {
 
 app.use(morgan("dev"));
 
-// Public routes
+// **Public Routes** (No authentication required)
 app.use("/health", healthRouter);
 app.use("/nutrition", nutritionRouter);
-app.use("/food", foodRouter);
+app.use("/food", foodRouter);  // Food route is now public
 
-// Protected routes (require authentication)
-app.use(authenticateJWT);
+// **Protected Routes** (Require authentication)
+app.use(authenticateJWT);  // All routes below this point require JWT authentication
 app.use("/profiles", profilesRouter);
 app.use("/hydration", hydrationRouter);
 app.use("/dashboard", dashboardRouter);
@@ -79,6 +80,7 @@ app.use("/motivations", motivationsRouter);
 app.use("/images", imagesRouter);
 app.use("/workout", workoutRouter);
 app.use("/googlefit", googlefitRouter);
+
 // Error handler (kept)
 app.use((err, req, res, next) => {
   console.error(err);
