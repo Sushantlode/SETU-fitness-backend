@@ -9,11 +9,13 @@ import { app } from "./src/app.js";
 import hydrationRouter from "./src/routes/hydration.js";
 import mealsRouter from "./src/routes/meals.js";
 import healthySwapsRouter from "./src/routes/healthySwaps.js";
+import userPlansRouter from "./src/routes/userPlans.js";
 
 // Use routes
 app.use("/hydration", hydrationRouter);
 app.use("/meals", mealsRouter);
 app.use("/healthy-swaps", healthySwapsRouter);
+app.use("/user-plans", userPlansRouter);
 
 const PORT = Number(process.env.PORT) || 3000;
 const server = app.listen(PORT, "0.0.0.0", () => {
