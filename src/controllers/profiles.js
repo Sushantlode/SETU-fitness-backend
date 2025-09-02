@@ -248,7 +248,13 @@
 //   } catch (e) { next(e); }
 // }
 
+
+
+
+
 import { pool } from "../db/pool.js";
+import crypto from "crypto";
+import { putObject, buildKey, presignGet } from "../utils/s3.js";
 
 /* ===== helpers & validators ===== */
 const toNum = (v) => (v == null ? NaN : Number(v));
@@ -277,6 +283,39 @@ function uid(req) {
   return req.user_id ?? req.user?.user_id ?? req.user?.id ?? req.user?.sub ?? null;
 }
 
+const extFromMime = (m) =>
+  /png$/i.test(m) ? "png" :
+  /jpe?g$/i.test(m) ? "jpg" :
+  /webp$/i.test(m) ? "webp" :
+  /gif$/i.test(m) ? "gif" : "bin";
+
+/* ===== UPLOAD PHOTO -> S3, store KEY in DB ===== */
+export async function uploadProfilePhoto(req, res, next) {
+  try {
+    const user_id = uid(req);
+    if (!user_id) return res.status(401).json({ hasError: true, code: "NO_USER", message: "user not resolved from token" });
+    if (!req.file) return res.status(400).json({ hasError: true, message: "image is required (field: image)" });
+
+    const ext = extFromMime(req.file.mimetype);
+    const fname = `${Date.now()}_${crypto.randomBytes(4).toString("hex")}.${ext}`;
+    const Key = buildKey("users", user_id, "profile", fname);
+
+    await putObject({ Key, Body: req.file.buffer, ContentType: req.file.mimetype });
+
+    // store KEY (not public URL)
+    const { rows } = await pool.query(`
+      INSERT INTO public.ftn_profiles (user_id, profile_picture_url, updated_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT (user_id)
+      DO UPDATE SET profile_picture_url = EXCLUDED.profile_picture_url, updated_at = NOW()
+      RETURNING first_name AS name, profile_picture_url AS user_image, age, height_cm, weight_kg, gender, bmi;
+    `, [user_id, Key]);
+
+    const url = await presignGet(Key, 3600);
+    return res.json({ hasError: false, key: Key, url, data: rows[0] || null });
+  } catch (e) { next(e); }
+}
+
 /* ===== CRUD ===== */
 
 // READ: GET /profiles  and GET /profiles/me
@@ -286,16 +325,20 @@ export async function getProfile(req, res, next) {
     if (!user_id) return res.status(401).json({ hasError: true, code: "NO_USER", message: "user not resolved from token" });
 
     const { rows } = await pool.query(
-      `SELECT
-         first_name AS name,
-         profile_picture_url AS user_image,
-         age, height_cm, weight_kg, gender, bmi
-       FROM public.ftn_profiles
-       WHERE user_id = $1
-       LIMIT 1`,
-      [user_id]
+      `SELECT first_name AS name,
+              profile_picture_url AS user_image, -- stores S3 KEY
+              age, height_cm, weight_kg, gender, bmi
+         FROM public.ftn_profiles
+        WHERE user_id = $1
+        LIMIT 1`, [user_id]
     );
-    res.json({ hasError: false, data: rows[0] || null });
+
+    const row = rows[0] || null;
+    if (row?.user_image && !/^https?:\/\//i.test(row.user_image)) {
+      row.user_image = await presignGet(row.user_image, 3600);
+    }
+
+    res.json({ hasError: false, data: row });
   } catch (e) { next(e); }
 }
 
@@ -322,7 +365,11 @@ export async function createProfile(req, res, next) {
     );
 
     if (!rows[0]) return res.status(409).json({ hasError: true, message: "Profile already exists" });
-    return res.status(201).json({ hasError: false, data: rows[0] });
+    const row = rows[0];
+    if (row?.user_image && !/^https?:\/\//i.test(row.user_image)) {
+      row.user_image = await presignGet(row.user_image, 3600);
+    }
+    return res.status(201).json({ hasError: false, data: row });
   } catch (e) { next(e); }
 }
 
@@ -355,7 +402,12 @@ export async function upsertProfile(req, res, next) {
        RETURNING first_name AS name, profile_picture_url AS user_image, age, height_cm, weight_kg, gender, bmi`,
       [user_id, String(name).trim(), user_image, age, height_cm, weight_kg, gender, bmi]
     );
-    res.json({ hasError: false, data: rows[0] });
+
+    const row = rows[0];
+    if (row?.user_image && !/^https?:\/\//i.test(row.user_image)) {
+      row.user_image = await presignGet(row.user_image, 3600);
+    }
+    res.json({ hasError: false, data: row });
   } catch (e) { next(e); }
 }
 
@@ -377,10 +429,7 @@ export async function patchProfile(req, res, next) {
     const sets = [];
     const params = [user_id];
 
-    const pushSet = (col, val) => {
-      params.push(val);
-      sets.push(`${col} = $${params.length}`);
-    };
+    const pushSet = (col, val) => { params.push(val); sets.push(`${col} = $${params.length}`); };
 
     if ("name" in req.body) {
       const name = String(req.body.name || "").trim();
@@ -426,8 +475,14 @@ export async function patchProfile(req, res, next) {
       WHERE user_id = $1
       RETURNING first_name AS name, profile_picture_url AS user_image, age, height_cm, weight_kg, gender, bmi`;
     const { rows } = await pool.query(sql, params);
+
     if (!rows[0]) return res.status(404).json({ hasError: true, message: "Profile not found" });
-    res.json({ hasError: false, data: rows[0] });
+
+    const row = rows[0];
+    if (row?.user_image && !/^https?:\/\//i.test(row.user_image)) {
+      row.user_image = await presignGet(row.user_image, 3600);
+    }
+    res.json({ hasError: false, data: row });
   } catch (e) { next(e); }
 }
 
@@ -438,8 +493,7 @@ export async function deleteProfile(req, res, next) {
     if (!user_id) return res.status(401).json({ hasError: true, code: "NO_USER", message: "user not resolved from token" });
 
     const { rowCount } = await pool.query(
-      `DELETE FROM public.ftn_profiles WHERE user_id = $1`,
-      [user_id]
+      `DELETE FROM public.ftn_profiles WHERE user_id = $1`, [user_id]
     );
     if (rowCount === 0) return res.status(404).json({ hasError: true, message: "Profile not found" });
     res.status(204).send();
