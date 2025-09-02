@@ -19,6 +19,7 @@ import motivationsRouter from "./routes/motivations.js";
 import imagesRouter from "./routes/images.js";
 import workoutRouter from "./routes/workout.js";
 import googlefitRouter from "./routes/googlefit.js";
+import healthySwapsRouter from "./routes/healthySwaps.js";
 import nutritionRouter from "./routes/nutrition.js";
 
 
@@ -78,6 +79,7 @@ app.use("/motivations", motivationsRouter);
 app.use("/images", imagesRouter);
 app.use("/workout", workoutRouter);
 app.use("/googlefit", googlefitRouter);
+app.use("/healthy-swaps", healthySwapsRouter);
 // Error handler (kept)
 app.use((err, req, res, next) => {
   console.error(err);
