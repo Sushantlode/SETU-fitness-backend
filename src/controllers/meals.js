@@ -1,253 +1,376 @@
 // src/controllers/meals.js
 import { pool } from "../db/pool.js";
 
-/* ---------- helpers ---------- */
-async function mealOwnedByUser(mealId, userId) {
+/* ===================== Bootstrap: create/patch table ===================== */
+export async function ensureMealsSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.ftn_daily_meals ( id BIGSERIAL PRIMARY KEY );
+
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='user_id')
+      THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN user_id TEXT; END IF;
+
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='day')
+      THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN day DATE NOT NULL DEFAULT CURRENT_DATE; END IF;
+
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='meal_type')
+      THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN meal_type TEXT; END IF;
+
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='food_name')
+      THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN food_name TEXT NOT NULL; END IF;
+
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='amount')
+      THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN amount NUMERIC(10,2); END IF;
+
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='unit')
+      THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN unit TEXT; END IF;
+
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='calories')
+      THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN calories INT; END IF;
+
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='protein_g')
+      THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN protein_g NUMERIC(10,2); END IF;
+
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='carbs_g')
+      THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN carbs_g NUMERIC(10,2); END IF;
+
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='fat_g')
+      THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN fat_g NUMERIC(10,2); END IF;
+
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='fiber_g')
+      THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN fiber_g NUMERIC(10,2); END IF;
+
+      /* NEW: S3 image key/url per meal */
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='image_s3_key')
+      THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN image_s3_key TEXT; END IF;
+
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='is_completed')
+      THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN is_completed BOOLEAN DEFAULT FALSE; END IF;
+
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='created_at')
+      THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN created_at TIMESTAMPTZ DEFAULT NOW(); END IF;
+
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='updated_at')
+      THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN updated_at TIMESTAMPTZ DEFAULT NOW(); END IF;
+    END $$;
+
+    CREATE INDEX IF NOT EXISTS idx_ftn_daily_meals_user_day
+      ON public.ftn_daily_meals (user_id, day, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_ftn_daily_meals_user_day_mealtype
+      ON public.ftn_daily_meals (user_id, day, meal_type);
+  `);
+}
+
+/* ===================== BMI → targets ===================== */
+function targetsFromBMI(bmi) {
+  if (bmi == null) return { calories: null, protein_g: null, carbs_g: null, fat_g: null, fiber_g: null };
+  let cal, p, c, f, fiber;
+  if (bmi < 18.5) { cal = 2400; p=0.20; c=0.55; f=0.25; fiber=25; }
+  else if (bmi < 25) { cal = 2100; p=0.20; c=0.50; f=0.30; fiber=30; }
+  else if (bmi < 30) { cal = 1800; p=0.25; c=0.40; f=0.35; fiber=30; }
+  else { cal = 1600; p=0.30; c=0.35; f=0.35; fiber=30; }
+  return {
+    calories: cal,
+    protein_g: Math.round(cal * p / 4),
+    carbs_g:   Math.round(cal * c / 4),
+    fat_g:     Math.round(cal * f / 9),
+    fiber_g:   fiber
+  };
+}
+
+/* ===================== Update flag per user/day ===================== */
+async function updateDailyCompletion(user_id, day) {
+  const { rows: prof } = await pool.query(
+    `SELECT bmi FROM public.ftn_profiles WHERE user_id = $1 LIMIT 1`,
+    [user_id]
+  );
+  const bmi = prof[0]?.bmi == null ? null : Number(prof[0].bmi);
+  const targets = targetsFromBMI(bmi);
+
   const { rows } = await pool.query(
-    `SELECT 1 FROM ftn_meals WHERE id = $1 AND user_id = $2 LIMIT 1`,
-    [mealId, userId]
+    `SELECT COALESCE(SUM(calories)::int,0) AS total_calories
+     FROM public.ftn_daily_meals WHERE user_id=$1 AND day=$2`,
+    [user_id, day]
   );
-  return !!rows[0];
-}
+  const consumed = Number(rows[0]?.total_calories || 0);
+  const done = targets.calories != null && consumed >= targets.calories;
 
-async function recalcMealTotals(mealId) {
   await pool.query(
-    `UPDATE ftn_meals m
-        SET total_calories = COALESCE((
-              SELECT SUM(calories)::int FROM ftn_meal_items WHERE meal_id = $1
-            ), 0),
-            updated_at = NOW()
-      WHERE id = $1`,
-    [mealId]
+    `UPDATE public.ftn_daily_meals
+     SET is_completed = $3, updated_at = NOW()
+     WHERE user_id=$1 AND day=$2`,
+    [user_id, day, done]
   );
 }
 
-/* ---------- Meals CRUD (scoped to req.user_id) ---------- */
+/* ===================== CRUD (user-scoped) ===================== */
 
-// GET /meals
-export async function list(req, res, next) {
+// POST /meals
+export async function createDailyMeal(req, res, next) {
   try {
+    await ensureMealsSchema();
+    const user_id = req.user_id;
+    if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
+
+    const {
+      day = null, meal_type = null, food_name,
+      amount = null, unit = null,
+      calories = null, protein_g = null, carbs_g = null, fat_g = null, fiber_g = null,
+      image_s3_key = null                 // << NEW
+    } = req.body || {};
+    if (!food_name?.trim()) return res.status(400).json({ hasError: true, message: "food_name is required" });
+
     const { rows } = await pool.query(
-      `SELECT id, user_id, name, meal_type, image_s3_key, total_calories, created_at
-         FROM ftn_meals
-        WHERE user_id = $1
-        ORDER BY created_at DESC
-        LIMIT 200`,
-      [req.user_id]
+      `INSERT INTO public.ftn_daily_meals
+         (user_id, day, meal_type, food_name, amount, unit, calories, protein_g, carbs_g, fat_g, fiber_g, image_s3_key)
+       VALUES ($1, COALESCE($2, CURRENT_DATE), $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       RETURNING *`,
+      [user_id, day, meal_type, food_name.trim(), amount, unit, calories, protein_g, carbs_g, fat_g, fiber_g, image_s3_key]
     );
-    res.json({ hasError: false, data: rows });
+
+    await updateDailyCompletion(user_id, rows[0].day);
+    res.json({ hasError: false, data: rows[0] });
   } catch (e) { next(e); }
 }
 
-// POST /meals
-export async function create(req, res, next) {
+// GET /meals?day=YYYY-MM-DD
+export async function listDailyMeals(req, res, next) {
   try {
+    await ensureMealsSchema();
     const user_id = req.user_id;
-    const {
-      name,
-      meal_type = null,
-      total_calories = null,
-      image_s3_key = null,
-      notes = null,
-    } = req.body || {};
+    if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
 
-    if (!name || !String(name).trim()) {
-      return res.status(400).json({ hasError: true, message: "name is required" });
-    }
+    const { day } = req.query;
+    const params = [user_id];
+    let sql = `
+      SELECT id, user_id, day, meal_type, food_name, amount, unit,
+             calories, protein_g, carbs_g, fat_g, fiber_g, image_s3_key, is_completed,
+             created_at, updated_at
+      FROM public.ftn_daily_meals
+      WHERE user_id = $1
+    `;
+    if (day) { sql += ` AND day = $2`; params.push(day); }
+    sql += ` ORDER BY day DESC, created_at DESC LIMIT 200`;
 
-    const { rows } = await pool.query(
-      `INSERT INTO ftn_meals (user_id, name, meal_type, total_calories, image_s3_key, notes)
-       VALUES ($1,$2,$3,$4,$5,$6)
-       RETURNING *`,
-      [user_id, String(name).trim(), meal_type, total_calories, image_s3_key, notes]
-    );
-    res.json({ hasError: false, data: rows[0] });
+    const { rows } = await pool.query(sql, params);
+    res.json({ hasError: false, data: rows });
   } catch (e) { next(e); }
 }
 
 // GET /meals/:id
-export async function getOne(req, res, next) {
+export async function getDailyMeal(req, res, next) {
   try {
+    await ensureMealsSchema();
+    const user_id = req.user_id;
     const { id } = req.params;
+    if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
+
     const { rows } = await pool.query(
-      `SELECT *
-         FROM ftn_meals
-        WHERE id = $1 AND user_id = $2
-        LIMIT 1`,
-      [id, req.user_id]
+      `SELECT * FROM public.ftn_daily_meals WHERE id = $1 AND user_id = $2`,
+      [id, user_id]
     );
     if (!rows[0]) return res.status(404).json({ hasError: true, message: "Not found" });
     res.json({ hasError: false, data: rows[0] });
   } catch (e) { next(e); }
 }
 
-// PUT /meals/:id  (NULL-friendly dynamic update)
-export async function update(req, res, next) {
+// PUT /meals/:id
+export async function updateDailyMeal(req, res, next) {
   try {
+    await ensureMealsSchema();
+    const user_id = req.user_id;
     const { id } = req.params;
-    if (!(await mealOwnedByUser(id, req.user_id))) {
-      return res.status(404).json({ hasError: true, message: "Not found" });
-    }
+    if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
 
-    const allowed = ["name", "meal_type", "total_calories", "image_s3_key", "notes"];
+    const fields = ["day","meal_type","food_name","amount","unit","calories","protein_g","carbs_g","fat_g","fiber_g","image_s3_key"];
     const sets = [];
-    const params = [id];
+    const vals = [id, user_id];
 
-    for (const k of allowed) {
-      if (Object.prototype.hasOwnProperty.call(req.body || {}, k)) {
-        params.push(req.body[k]); // can be null
-        sets.push(`${k} = $${params.length}`);
+    for (const f of fields) {
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, f)) {
+        vals.push(req.body[f]);
+        sets.push(`${f} = $${vals.length}`);
       }
     }
     if (!sets.length) return res.status(400).json({ hasError: true, message: "No fields to update" });
 
-    params.push(req.user_id);
-
     const { rows } = await pool.query(
-      `UPDATE ftn_meals
-          SET ${sets.join(", ")}, updated_at = NOW()
-        WHERE id = $1 AND user_id = $${params.length}
-        RETURNING *`,
-      params
-    );
-    if (!rows[0]) return res.status(404).json({ hasError: true, message: "Not found" });
-    res.json({ hasError: false, data: rows[0] });
-  } catch (e) { next(e); }
-}
-
-// DELETE /meals/:id  (hard delete + items)
-export async function remove(req, res, next) {
-  const client = await pool.connect();
-  try {
-    const { id } = req.params;
-    if (!(await mealOwnedByUser(id, req.user_id))) {
-      client.release();
-      return res.status(404).json({ hasError: true, message: "Not found" });
-    }
-
-    await client.query("BEGIN");
-    await client.query(`DELETE FROM ftn_meal_items WHERE meal_id = $1`, [id]); // safe even without FK
-    await client.query(`DELETE FROM ftn_meals WHERE id = $1 AND user_id = $2`, [id, req.user_id]);
-    await client.query("COMMIT");
-
-    res.json({ hasError: false });
-  } catch (e) {
-    try { await client.query("ROLLBACK"); } catch {}
-    next(e);
-  } finally {
-    client.release();
-  }
-}
-
-/* ---------- Meal Items (guarded by ownership) ---------- */
-
-// POST /meals/:id/items
-export async function addItem(req, res, next) {
-  try {
-    const { id } = req.params; // meal_id
-    const user_id = req.user_id;
-    if (!(await mealOwnedByUser(id, user_id))) {
-      return res.status(403).json({ hasError: true, message: "Forbidden" });
-    }
-
-    const {
-      food_id = null,
-      custom_food_name = null,
-      quantity = null,
-      unit = null,
-      calories = null,
-      protein_g = null,
-      carbs_g = null,
-      fat_g = null,
-    } = req.body || {};
-
-    if (!custom_food_name && !food_id) {
-      return res.status(400).json({ hasError: true, message: "custom_food_name or food_id required" });
-    }
-
-    const { rows } = await pool.query(
-      `INSERT INTO ftn_meal_items (meal_id, food_id, custom_food_name, quantity, unit, calories, protein_g, carbs_g, fat_g)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      `UPDATE public.ftn_daily_meals
+       SET ${sets.join(", ")}, updated_at = NOW()
+       WHERE id = $1 AND user_id = $2
        RETURNING *`,
-      [id, food_id, custom_food_name, quantity, unit, calories, protein_g, carbs_g, fat_g]
-    );
-
-    await recalcMealTotals(id);
-    res.json({ hasError: false, data: rows[0] });
-  } catch (e) { next(e); }
-}
-
-// GET /meals/:id/items
-export async function listItems(req, res, next) {
-  try {
-    const { id } = req.params; // meal_id
-    const user_id = req.user_id;
-    if (!(await mealOwnedByUser(id, user_id))) {
-      return res.status(403).json({ hasError: true, message: "Forbidden" });
-    }
-
-    const { rows } = await pool.query(
-      `SELECT *
-         FROM ftn_meal_items
-        WHERE meal_id = $1
-        ORDER BY id`,
-      [id]
-    );
-    res.json({ hasError: false, data: rows });
-  } catch (e) { next(e); }
-}
-
-// PUT /meals/:id/items/:item_id  (NULL-friendly)
-export async function updateItem(req, res, next) {
-  try {
-    const { id, item_id } = req.params; // meal_id, item_id
-    const user_id = req.user_id;
-    if (!(await mealOwnedByUser(id, user_id))) {
-      return res.status(403).json({ hasError: true, message: "Forbidden" });
-    }
-
-    const allowed = ["food_id","custom_food_name","quantity","unit","calories","protein_g","carbs_g","fat_g"];
-    const sets = [];
-    const params = [id, item_id];
-
-    for (const k of allowed) {
-      if (Object.prototype.hasOwnProperty.call(req.body || {}, k)) {
-        params.push(req.body[k]); // can be null
-        sets.push(`${k} = $${params.length}`);
-      }
-    }
-    if (!sets.length) return res.status(400).json({ hasError: true, message: "No fields to update" });
-
-    const { rows } = await pool.query(
-      `UPDATE ftn_meal_items
-          SET ${sets.join(", ")}
-        WHERE meal_id = $1 AND id = $2
-        RETURNING *`,
-      params
+      vals
     );
     if (!rows[0]) return res.status(404).json({ hasError: true, message: "Not found" });
 
-    await recalcMealTotals(id);
+    await updateDailyCompletion(user_id, rows[0].day);
     res.json({ hasError: false, data: rows[0] });
   } catch (e) { next(e); }
 }
 
-// DELETE /meals/:id/items/:item_id
-export async function removeItem(req, res, next) {
+// DELETE /meals/:id
+export async function deleteDailyMeal(req, res, next) {
   try {
-    const { id, item_id } = req.params; // meal_id, item_id
+    await ensureMealsSchema();
     const user_id = req.user_id;
-    if (!(await mealOwnedByUser(id, user_id))) {
-      return res.status(403).json({ hasError: true, message: "Forbidden" });
-    }
+    const { id } = req.params;
+    if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
+
+    const { rows: pre } = await pool.query(
+      `SELECT day FROM public.ftn_daily_meals WHERE id=$1 AND user_id=$2`,
+      [id, user_id]
+    );
+    if (!pre[0]) return res.status(404).json({ hasError: true, message: "Not found" });
+    const day = pre[0].day;
 
     const { rowCount } = await pool.query(
-      `DELETE FROM ftn_meal_items WHERE id = $2 AND meal_id = $1`,
-      [id, item_id]
+      `DELETE FROM public.ftn_daily_meals WHERE id = $1 AND user_id = $2`,
+      [id, user_id]
     );
     if (!rowCount) return res.status(404).json({ hasError: true, message: "Not found" });
 
-    await recalcMealTotals(id);
-    res.json({ hasError: false });
+    await updateDailyCompletion(user_id, day);
+    res.json({ hasError: false, success: true });
+  } catch (e) { next(e); }
+}
+
+/* ===================== Reports ===================== */
+
+// GET /meals/daily/summary?day=YYYY-MM-DD
+export async function dailyConsumed(req, res, next) {
+  try {
+    await ensureMealsSchema();
+    const user_id = req.user_id;
+    const day = req.query.day;
+    if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
+    if (!day) return res.status(400).json({ hasError: true, message: "day is required (YYYY-MM-DD)" });
+
+    const { rows } = await pool.query(
+      `SELECT
+          COALESCE(SUM(calories)::int, 0) AS calories,
+          COALESCE(SUM(protein_g), 0)     AS protein_g,
+          COALESCE(SUM(carbs_g), 0)       AS carbs_g,
+          COALESCE(SUM(fat_g), 0)         AS fat_g,
+          COALESCE(SUM(fiber_g), 0)       AS fiber_g,
+          BOOL_OR(is_completed)           AS is_completed
+       FROM public.ftn_daily_meals
+       WHERE user_id = $1 AND day = $2`,
+      [user_id, day]
+    );
+    res.json({
+      hasError: false,
+      day,
+      consumed: {
+        calories: Number(rows[0].calories || 0),
+        protein_g: Number(rows[0].protein_g || 0),
+        carbs_g: Number(rows[0].carbs_g || 0),
+        fat_g: Number(rows[0].fat_g || 0),
+        fiber_g: Number(rows[0].fiber_g || 0),
+      },
+      is_completed: !!rows[0].is_completed
+    });
+  } catch (e) { next(e); }
+}
+
+// GET /meals/daily/status?day=YYYY-MM-DD
+export async function dailyStatus(req, res, next) {
+  try {
+    await ensureMealsSchema();
+    const user_id = req.user_id;
+    const day = req.query.day;
+    if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
+    if (!day) return res.status(400).json({ hasError: true, message: "day is required (YYYY-MM-DD)" });
+
+    const { rows: prof } = await pool.query(
+      `SELECT bmi FROM public.ftn_profiles WHERE user_id = $1 LIMIT 1`,
+      [user_id]
+    );
+    const bmi = prof[0]?.bmi == null ? null : Number(prof[0].bmi);
+    const targets = targetsFromBMI(bmi);
+
+    const { rows } = await pool.query(
+      `SELECT
+          COALESCE(SUM(calories)::int, 0) AS calories,
+          COALESCE(SUM(protein_g), 0)     AS protein_g,
+          COALESCE(SUM(carbs_g), 0)       AS carbs_g,
+          COALESCE(SUM(fat_g), 0)         AS fat_g,
+          COALESCE(SUM(fiber_g), 0)       AS fiber_g,
+          BOOL_OR(is_completed)           AS is_completed
+       FROM public.ftn_daily_meals
+       WHERE user_id = $1 AND day = $2`,
+      [user_id, day]
+    );
+    const c = rows[0];
+    const pct = (cons, targ) => (!targ || targ <= 0 ? null : +((Number(cons||0)/targ)*100).toFixed(1));
+
+    res.json({
+      hasError: false,
+      day,
+      bmi,
+      targets,
+      consumed: {
+        calories: Number(c.calories || 0),
+        protein_g: Number(c.protein_g || 0),
+        carbs_g: Number(c.carbs_g || 0),
+        fat_g: Number(c.fat_g || 0),
+        fiber_g: Number(c.fiber_g || 0),
+      },
+      completion: {
+        calories_pct: pct(c.calories, targets.calories),
+        protein_pct:  pct(c.protein_g, targets.protein_g),
+        carbs_pct:    pct(c.carbs_g,   targets.carbs_g),
+        fat_pct:      pct(c.fat_g,     targets.fat_g),
+        fiber_pct:    pct(c.fiber_g,   targets.fiber_g),
+      },
+      is_completed: !!c.is_completed
+    });
+  } catch (e) { next(e); }
+}
+
+// GET /meals/today
+export async function todayMeals(req, res, next) {
+  try {
+    await ensureMealsSchema();
+    const user_id = req.user_id;
+    if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
+
+    const { rows: meals } = await pool.query(
+      `SELECT id, user_id, day, meal_type, food_name, amount, unit,
+              calories, protein_g, carbs_g, fat_g, fiber_g, image_s3_key, is_completed,
+              created_at, updated_at
+       FROM public.ftn_daily_meals
+       WHERE user_id = $1 AND day = CURRENT_DATE
+       ORDER BY created_at DESC`,
+      [user_id]
+    );
+
+    const { rows: totalsRows } = await pool.query(
+      `SELECT
+          COALESCE(SUM(calories)::int, 0) AS calories,
+          COALESCE(SUM(protein_g), 0)     AS protein_g,
+          COALESCE(SUM(carbs_g), 0)       AS carbs_g,
+          COALESCE(SUM(fat_g), 0)         AS fat_g,
+          COALESCE(SUM(fiber_g), 0)       AS fiber_g,
+          BOOL_OR(is_completed)           AS is_completed
+       FROM public.ftn_daily_meals
+       WHERE user_id = $1 AND day = CURRENT_DATE`,
+      [user_id]
+    );
+
+    const totals = totalsRows[0] || {};
+    res.json({
+      hasError: false,
+      day: new Date().toISOString().slice(0,10),
+      meals,
+      totals: {
+        calories: Number(totals.calories || 0),
+        protein_g: Number(totals.protein_g || 0),
+        carbs_g:   Number(totals.carbs_g || 0),
+        fat_g:     Number(totals.fat_g || 0),
+        fiber_g:   Number(totals.fiber_g || 0),
+      },
+      is_completed: !!totals.is_completed
+    });
   } catch (e) { next(e); }
 }

@@ -17,6 +17,9 @@ app.use("/meals", mealsRouter);
 app.use("/healthy-swaps", healthySwapsRouter);
 app.use("/user-plans", userPlansRouter);
 
+
+import { app } from "./src/app.js";
+
 const PORT = Number(process.env.PORT) || 3000;
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Fitness backend listening on http://localhost:${PORT}`);
