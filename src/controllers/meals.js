@@ -2,15 +2,10 @@
 import { pool } from "../db/pool.js";
 
 /* ===================== Bootstrap: create/patch table ===================== */
-/* We NEVER create/alter ftn_profiles. We only read BMI from it. */
 export async function ensureMealsSchema() {
   await pool.query(`
-    /* Create the table shell if missing */
-    CREATE TABLE IF NOT EXISTS public.ftn_daily_meals (
-      id BIGSERIAL PRIMARY KEY
-    );
+    CREATE TABLE IF NOT EXISTS public.ftn_daily_meals ( id BIGSERIAL PRIMARY KEY );
 
-    /* Add required columns if missing (idempotent, safe on every boot) */
     DO $$
     BEGIN
       IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='user_id')
@@ -46,6 +41,10 @@ export async function ensureMealsSchema() {
       IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='fiber_g')
       THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN fiber_g NUMERIC(10,2); END IF;
 
+      /* NEW: S3 image key/url per meal */
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='image_s3_key')
+      THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN image_s3_key TEXT; END IF;
+
       IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='is_completed')
       THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN is_completed BOOLEAN DEFAULT FALSE; END IF;
 
@@ -56,7 +55,6 @@ export async function ensureMealsSchema() {
       THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN updated_at TIMESTAMPTZ DEFAULT NOW(); END IF;
     END $$;
 
-    /* Indexes */
     CREATE INDEX IF NOT EXISTS idx_ftn_daily_meals_user_day
       ON public.ftn_daily_meals (user_id, day, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_ftn_daily_meals_user_day_mealtype
@@ -64,7 +62,7 @@ export async function ensureMealsSchema() {
   `);
 }
 
-/* ===================== BMI → daily targets ===================== */
+/* ===================== BMI → targets ===================== */
 function targetsFromBMI(bmi) {
   if (bmi == null) return { calories: null, protein_g: null, carbs_g: null, fat_g: null, fiber_g: null };
   let cal, p, c, f, fiber;
@@ -81,9 +79,8 @@ function targetsFromBMI(bmi) {
   };
 }
 
-/* ===================== Flag updater: is_completed per user/day ===================== */
+/* ===================== Update flag per user/day ===================== */
 async function updateDailyCompletion(user_id, day) {
-  // BMI from existing ftn_profiles
   const { rows: prof } = await pool.query(
     `SELECT bmi FROM public.ftn_profiles WHERE user_id = $1 LIMIT 1`,
     [user_id]
@@ -91,7 +88,6 @@ async function updateDailyCompletion(user_id, day) {
   const bmi = prof[0]?.bmi == null ? null : Number(prof[0].bmi);
   const targets = targetsFromBMI(bmi);
 
-  // consumed calories that day
   const { rows } = await pool.query(
     `SELECT COALESCE(SUM(calories)::int,0) AS total_calories
      FROM public.ftn_daily_meals WHERE user_id=$1 AND day=$2`,
@@ -120,16 +116,17 @@ export async function createDailyMeal(req, res, next) {
     const {
       day = null, meal_type = null, food_name,
       amount = null, unit = null,
-      calories = null, protein_g = null, carbs_g = null, fat_g = null, fiber_g = null
+      calories = null, protein_g = null, carbs_g = null, fat_g = null, fiber_g = null,
+      image_s3_key = null                 // << NEW
     } = req.body || {};
     if (!food_name?.trim()) return res.status(400).json({ hasError: true, message: "food_name is required" });
 
     const { rows } = await pool.query(
       `INSERT INTO public.ftn_daily_meals
-         (user_id, day, meal_type, food_name, amount, unit, calories, protein_g, carbs_g, fat_g, fiber_g)
-       VALUES ($1, COALESCE($2, CURRENT_DATE), $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         (user_id, day, meal_type, food_name, amount, unit, calories, protein_g, carbs_g, fat_g, fiber_g, image_s3_key)
+       VALUES ($1, COALESCE($2, CURRENT_DATE), $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING *`,
-      [user_id, day, meal_type, food_name.trim(), amount, unit, calories, protein_g, carbs_g, fat_g, fiber_g]
+      [user_id, day, meal_type, food_name.trim(), amount, unit, calories, protein_g, carbs_g, fat_g, fiber_g, image_s3_key]
     );
 
     await updateDailyCompletion(user_id, rows[0].day);
@@ -148,7 +145,7 @@ export async function listDailyMeals(req, res, next) {
     const params = [user_id];
     let sql = `
       SELECT id, user_id, day, meal_type, food_name, amount, unit,
-             calories, protein_g, carbs_g, fat_g, fiber_g, is_completed,
+             calories, protein_g, carbs_g, fat_g, fiber_g, image_s3_key, is_completed,
              created_at, updated_at
       FROM public.ftn_daily_meals
       WHERE user_id = $1
@@ -186,7 +183,7 @@ export async function updateDailyMeal(req, res, next) {
     const { id } = req.params;
     if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
 
-    const fields = ["day","meal_type","food_name","amount","unit","calories","protein_g","carbs_g","fat_g","fiber_g"];
+    const fields = ["day","meal_type","food_name","amount","unit","calories","protein_g","carbs_g","fat_g","fiber_g","image_s3_key"];
     const sets = [];
     const vals = [id, user_id];
 
@@ -240,7 +237,7 @@ export async function deleteDailyMeal(req, res, next) {
 
 /* ===================== Reports ===================== */
 
-// GET /meals/daily/summary?day=YYYY-MM-DD  (totals consumed + flag)
+// GET /meals/daily/summary?day=YYYY-MM-DD
 export async function dailyConsumed(req, res, next) {
   try {
     await ensureMealsSchema();
@@ -276,7 +273,7 @@ export async function dailyConsumed(req, res, next) {
   } catch (e) { next(e); }
 }
 
-// GET /meals/daily/status?day=YYYY-MM-DD  (targets + consumed + % + flag)
+// GET /meals/daily/status?day=YYYY-MM-DD
 export async function dailyStatus(req, res, next) {
   try {
     await ensureMealsSchema();
@@ -331,7 +328,7 @@ export async function dailyStatus(req, res, next) {
   } catch (e) { next(e); }
 }
 
-// GET /meals/today  (today's meals + today's totals + flag)
+// GET /meals/today
 export async function todayMeals(req, res, next) {
   try {
     await ensureMealsSchema();
@@ -340,7 +337,7 @@ export async function todayMeals(req, res, next) {
 
     const { rows: meals } = await pool.query(
       `SELECT id, user_id, day, meal_type, food_name, amount, unit,
-              calories, protein_g, carbs_g, fat_g, fiber_g, is_completed,
+              calories, protein_g, carbs_g, fat_g, fiber_g, image_s3_key, is_completed,
               created_at, updated_at
        FROM public.ftn_daily_meals
        WHERE user_id = $1 AND day = CURRENT_DATE
