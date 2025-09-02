@@ -1,28 +1,23 @@
-// src/middleware/auth.js
+// src/middleware/auth.js (ESM)
 import jwt from "jsonwebtoken";
-import {
-  verifyAccess,
-  verifyRefresh,
-  signAccessToken,
-  signRefreshToken,
-} from "../utils/tokens.js";
+import axios from "axios";
 
 /**
- * Behavior:
- * - If access token valid -> next()
- * - If access expired AND X-Refresh-Token present -> mint new pair, set headers, next()
- * - If access expired AND no refresh -> 401 ACCESS_EXPIRED (do NOT demand refresh)
- * - If token invalid (bad signature) -> 401 INVALID_TOKEN
- *
- * Notes:
- * - Header name is case-insensitive; we read "authorization" and "x-refresh-token".
- * - We set new tokens on response headers; make sure CORS exposes them.
+ * - Verifies access JWT with JWT_SECRET
+ * - If expired and X-Refresh-Token exists -> calls REFRESH_TOKEN_URL to mint new pair
+ * - Sets headers: Authorization: Bearer <new>, X-Refresh-Token: <new>
+ * - Populates req.user and req.user_id (backward-compatible)
  */
-export function authenticateJWT(req, res, next) {
+export async function authenticateJWT(req, res, next) {
   const auth = req.headers.authorization || req.headers.Authorization || "";
-  const [scheme, token] = auth.split(" ");
+  const [, token] = auth.split(" ");
+  const refresh =
+    req.headers["x-refresh-token"] ||
+    req.headers["X-Refresh-Token"] ||
+    req.headers["x-refresh"] ||
+    null;
 
-  if (!/^Bearer$/i.test(scheme) || !token) {
+  if (!token) {
     return res.status(401).json({
       hasError: true,
       code: "MISSING_ACCESS_TOKEN",
@@ -31,26 +26,20 @@ export function authenticateJWT(req, res, next) {
   }
 
   try {
-    const decoded = verifyAccess(token);
-    if (!decoded?.user_id) {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const userId = decoded.user_id ?? decoded.userId ?? decoded.id;
+    if (!userId) {
       return res.status(401).json({
         hasError: true,
         code: "INVALID_PAYLOAD",
         message: "user_id missing in token",
       });
     }
-    req.user_id = decoded.user_id;
     req.user = decoded;
+    req.user_id = userId;
     return next();
   } catch (err) {
-    // Expired access token -> try silent refresh only if client sent refresh
-    if (err instanceof jwt.TokenExpiredError) {
-      const refresh =
-        req.headers["x-refresh-token"] ||
-        req.headers["X-Refresh-Token"] ||
-        req.headers["x-refresh"] ||
-        null;
-
+    if (err.name === "TokenExpiredError") {
       if (!refresh) {
         return res.status(401).json({
           hasError: true,
@@ -60,40 +49,59 @@ export function authenticateJWT(req, res, next) {
       }
 
       try {
-        const r = verifyRefresh(refresh);
+        if (!process.env.REFRESH_TOKEN_URL) {
+          return res.status(500).json({
+            hasError: true,
+            code: "CONFIG_MISSING",
+            message: "REFRESH_TOKEN_URL not set",
+          });
+        }
 
-        // (Optional) check tokenVersion in DB here to revoke stale refresh tokens
-        // const { rows } = await pool.query('SELECT token_version FROM users WHERE id=$1',[r.user_id]);
-        // if (rows[0].token_version !== r.tokenVersion) throw new Error('STALE_REFRESH');
+        // Call your refresh endpoint
+        const resp = await axios.post(process.env.REFRESH_TOKEN_URL, {
+          refreshToken: refresh,
+        });
 
-        const payload = {
-          user_id: r.user_id,
-          email: r.email, // keep payload minimal
-          // tokenVersion: r.tokenVersion,
-        };
+        // Be tolerant to response shapes
+        const accessToken =
+          resp.data?.accessToken ||
+          resp.data?.token ||
+          resp.data?.data?.accessToken;
+        const newRefreshToken =
+          resp.data?.newRefreshToken ||
+          resp.data?.refreshToken ||
+          resp.data?.data?.refreshToken;
 
-        const newAccess = signAccessToken(payload);
-        const newRefresh = signRefreshToken(payload);
+        if (!accessToken) throw new Error("No accessToken in refresh response");
 
-        // expose to client; ensure CORS exposes these headers
-        res.setHeader("Authorization", `Bearer ${newAccess}`);
-        res.setHeader("X-Refresh-Token", newRefresh);
+        // Send new tokens to client (CORS must expose these; you already do)
+        res.setHeader("Authorization", `Bearer ${accessToken}`);
+        if (newRefreshToken) res.setHeader("X-Refresh-Token", newRefreshToken);
 
-        // trust what we just signed instead of re-verifying
-        req.user_id = payload.user_id;
-        req.user = payload;
-
+        // Trust the new token
+        const decodedNew = jwt.verify(accessToken, process.env.JWT_SECRET);
+        const userId = decodedNew.user_id ?? decodedNew.userId ?? decodedNew.id;
+        if (!userId) {
+          return res.status(401).json({
+            hasError: true,
+            code: "INVALID_PAYLOAD",
+            message: "user_id missing in refreshed token",
+          });
+        }
+        req.user = decodedNew;
+        req.user_id = userId;
         return next();
       } catch (e) {
         return res.status(401).json({
           hasError: true,
           code: "REFRESH_FAILED",
-          message: "Failed to refresh token. Please log in again.",
+          message:
+            e?.response?.data?.message || e.message || "Failed to refresh token",
         });
       }
     }
 
-    // Any other JWT error (bad signature, malformed, etc.)
+    // Bad signature / malformed
     return res.status(401).json({
       hasError: true,
       code: "INVALID_TOKEN",

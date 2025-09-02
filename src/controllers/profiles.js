@@ -248,9 +248,6 @@
 //   } catch (e) { next(e); }
 // }
 
-
-
-// controllers/profiles.js
 import { pool } from "../db/pool.js";
 
 /* ===== helpers & validators ===== */
@@ -275,18 +272,25 @@ function computeBmi(weightKg, heightCm) {
   return +(w / (m * m)).toFixed(2);
 }
 
+// Resolve user id from middleware-decoded token, safely
+function uid(req) {
+  return req.user_id ?? req.user?.user_id ?? req.user?.id ?? req.user?.sub ?? null;
+}
+
 /* ===== CRUD ===== */
 
-// READ: GET /profiles
+// READ: GET /profiles  and GET /profiles/me
 export async function getProfile(req, res, next) {
   try {
-    const user_id = req.user_id;
+    const user_id = uid(req);
+    if (!user_id) return res.status(401).json({ hasError: true, code: "NO_USER", message: "user not resolved from token" });
+
     const { rows } = await pool.query(
       `SELECT
          first_name AS name,
          profile_picture_url AS user_image,
          age, height_cm, weight_kg, gender, bmi
-       FROM ftn_profiles
+       FROM public.ftn_profiles
        WHERE user_id = $1
        LIMIT 1`,
       [user_id]
@@ -295,10 +299,12 @@ export async function getProfile(req, res, next) {
   } catch (e) { next(e); }
 }
 
-// CREATE (create-only): POST /profiles
+// CREATE: POST /profiles  (409 if already exists)
 export async function createProfile(req, res, next) {
   try {
-    const user_id = req.user_id;
+    const user_id = uid(req);
+    if (!user_id) return res.status(401).json({ hasError: true, code: "NO_USER", message: "user not resolved from token" });
+
     const { name, user_image = null, age, height_cm, weight_kg, gender } = req.body || {};
     const err = validateFull({ name, age, height_cm, weight_kg, gender });
     if (err) return res.status(400).json({ hasError: true, message: err });
@@ -306,7 +312,7 @@ export async function createProfile(req, res, next) {
     const bmi = computeBmi(weight_kg, height_cm);
 
     const { rows } = await pool.query(
-      `INSERT INTO ftn_profiles (
+      `INSERT INTO public.ftn_profiles (
          user_id, first_name, profile_picture_url, age, height_cm, weight_kg, gender, bmi
        )
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -315,17 +321,17 @@ export async function createProfile(req, res, next) {
       [user_id, String(name).trim(), user_image, age, height_cm, weight_kg, gender, bmi]
     );
 
-    if (!rows[0]) {
-      return res.status(409).json({ hasError: true, message: "Profile already exists" });
-    }
+    if (!rows[0]) return res.status(409).json({ hasError: true, message: "Profile already exists" });
     return res.status(201).json({ hasError: false, data: rows[0] });
   } catch (e) { next(e); }
 }
 
-// UPSERT: PUT /profiles
+// UPSERT: PUT /profiles  (create if missing)
 export async function upsertProfile(req, res, next) {
   try {
-    const user_id = req.user_id;
+    const user_id = uid(req);
+    if (!user_id) return res.status(401).json({ hasError: true, code: "NO_USER", message: "user not resolved from token" });
+
     const { name, user_image = null, age, height_cm, weight_kg, gender } = req.body || {};
     const err = validateFull({ name, age, height_cm, weight_kg, gender });
     if (err) return res.status(400).json({ hasError: true, message: err });
@@ -333,7 +339,7 @@ export async function upsertProfile(req, res, next) {
     const bmi = computeBmi(weight_kg, height_cm);
 
     const { rows } = await pool.query(
-      `INSERT INTO ftn_profiles (
+      `INSERT INTO public.ftn_profiles (
          user_id, first_name, profile_picture_url, age, height_cm, weight_kg, gender, bmi
        )
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -356,11 +362,11 @@ export async function upsertProfile(req, res, next) {
 // PARTIAL UPDATE: PATCH /profiles
 export async function patchProfile(req, res, next) {
   try {
-    const user_id = req.user_id;
+    const user_id = uid(req);
+    if (!user_id) return res.status(401).json({ hasError: true, code: "NO_USER", message: "user not resolved from token" });
 
-    // fetch current for BMI recompute if height/weight change
     const { rows: curRows } = await pool.query(
-      `SELECT height_cm, weight_kg FROM ftn_profiles WHERE user_id = $1 LIMIT 1`,
+      `SELECT height_cm, weight_kg FROM public.ftn_profiles WHERE user_id = $1 LIMIT 1`,
       [user_id]
     );
     const current = curRows[0] || {};
@@ -408,18 +414,14 @@ export async function patchProfile(req, res, next) {
     const shouldRecomputeBmi =
       ("height_cm" in req.body) || ("weight_kg" in req.body) || current.height_cm == null || current.weight_kg == null;
 
-    if (
-      shouldRecomputeBmi &&
-      Number.isFinite(nextHeight) && Number.isFinite(nextWeight) &&
-      nextHeight > 0 && nextWeight > 0
-    ) {
+    if (shouldRecomputeBmi && Number.isFinite(nextHeight) && Number.isFinite(nextWeight) && nextHeight > 0 && nextWeight > 0) {
       pushSet("bmi", computeBmi(nextWeight, nextHeight));
     }
 
     if (sets.length === 0) return res.status(400).json({ hasError: true, message: "No valid fields to update" });
 
     const sql = `
-      UPDATE ftn_profiles
+      UPDATE public.ftn_profiles
       SET ${sets.join(", ")}, updated_at = NOW()
       WHERE user_id = $1
       RETURNING first_name AS name, profile_picture_url AS user_image, age, height_cm, weight_kg, gender, bmi`;
@@ -432,9 +434,11 @@ export async function patchProfile(req, res, next) {
 // DELETE: DELETE /profiles
 export async function deleteProfile(req, res, next) {
   try {
-    const user_id = req.user_id;
+    const user_id = uid(req);
+    if (!user_id) return res.status(401).json({ hasError: true, code: "NO_USER", message: "user not resolved from token" });
+
     const { rowCount } = await pool.query(
-      `DELETE FROM ftn_profiles WHERE user_id = $1`,
+      `DELETE FROM public.ftn_profiles WHERE user_id = $1`,
       [user_id]
     );
     if (rowCount === 0) return res.status(404).json({ hasError: true, message: "Profile not found" });

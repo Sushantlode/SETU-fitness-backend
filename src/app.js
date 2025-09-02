@@ -5,8 +5,14 @@ import cors from "cors";
 import dotenv from "dotenv";
 dotenv.config();
 
-import { authenticateJWT } from "./middleware/auth.js";  // Authentication middleware
+import { authenticateJWT } from "./middleware/auth.js";
+
+// PUBLIC routers
 import healthRouter from "./routes/health.js";
+import nutritionRouter from "./routes/nutrition.js";
+import foodRouter from "./routes/food.js";
+
+// PROTECTED routers
 import profilesRouter from "./routes/profiles.js";
 import hydrationRouter from "./routes/hydration.js";
 import dashboardRouter from "./routes/dashboard.js";
@@ -20,55 +26,47 @@ import imagesRouter from "./routes/images.js";
 import workoutRouter from "./routes/workout.js";
 import googlefitRouter from "./routes/googlefit.js";
 import healthySwapsRouter from "./routes/healthySwaps.js";
-import nutritionRouter from "./routes/nutrition.js";
-import foodRouter from "./routes/food.js";  // Public route
+import userPlansRouter from "./routes/userPlans.js";
 
 export const app = express();
 
-// CORS configuration
-app.use(
-  cors({
-    origin: true,
-    credentials: true,
-    allowedHeaders: ["Content-Type", "Authorization", "X-Refresh-Token"],
-    exposedHeaders: ["Authorization", "X-Refresh-Token"],
-  })
-);
+// CORS
+app.use(cors({
+  origin: true,
+  credentials: true,
+  allowedHeaders: ["Content-Type", "Authorization", "X-Refresh-Token"],
+  exposedHeaders: ["Authorization", "X-Refresh-Token"],
+}));
 
-// Configure body parser with better error handling
+// Logs first
+app.use(morgan("dev"));
+
+// JSON body parser with guard
 app.use(express.json({
   limit: "2mb",
-  strict: false, // Allow single values and other non-object JSON
-  verify: (req, res, buf, encoding) => {
-    try {
-      JSON.parse(buf);
-    } catch (e) {
-      throw new Error('Invalid JSON in request body');
-    }
+  strict: false,
+  verify: (req, res, buf) => {
+    if (!buf || buf.length === 0) return;
+    try { JSON.parse(buf.toString("utf8")); }
+    catch { throw new Error("Invalid JSON in request body"); }
   }
 }));
 
-// Custom JSON error handler
+// JSON syntax error -> 400
 app.use((err, req, res, next) => {
-  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
-    return res.status(400).json({
-      hasError: true,
-      message: 'Invalid JSON in request body',
-      details: 'Please ensure your JSON is properly formatted with double quotes for property names'
-    });
+  if (err instanceof SyntaxError && "body" in err) {
+    return res.status(400).json({ hasError: true, message: "Invalid JSON in request body" });
   }
-  next();
+  next(err);
 });
 
-app.use(morgan("dev"));
-
-// **Public Routes** (No authentication required)
+// ---------- Public routes ----------
 app.use("/health", healthRouter);
 app.use("/nutrition", nutritionRouter);
-app.use("/food", foodRouter);  // Food route is now public
+app.use("/food", foodRouter);
 
-// **Protected Routes** (Require authentication)
-app.use(authenticateJWT);  // All routes below this point require JWT authentication
+// ---------- Protected routes ----------
+app.use(authenticateJWT);
 app.use("/profiles", profilesRouter);
 app.use("/hydration", hydrationRouter);
 app.use("/dashboard", dashboardRouter);
@@ -82,10 +80,10 @@ app.use("/images", imagesRouter);
 app.use("/workout", workoutRouter);
 app.use("/googlefit", googlefitRouter);
 app.use("/healthy-swaps", healthySwapsRouter);
-// Error handler (kept)
+app.use("/user-plans", userPlansRouter);
+
+// Generic error handler
 app.use((err, req, res, next) => {
   console.error(err);
-  res
-    .status(err.status || 500)
-    .json({ hasError: true, message: err.message || "Internal error" });
+  res.status(err.status || 500).json({ hasError: true, message: err.message || "Internal error" });
 });
