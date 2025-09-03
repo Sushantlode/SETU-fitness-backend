@@ -11,7 +11,7 @@ const extFromMime = (m) =>
   /gif$/i.test(m)     ? "gif"  :
   /hei[cf]$/i.test(m) ? "heic" : "bin";
 
-/* ===================== Bootstrap: create/patch table ===================== */
+/* ===================== Bootstrap: create/patch tables ===================== */
 export async function ensureMealsSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS public.ftn_daily_meals ( id BIGSERIAL PRIMARY KEY );
@@ -69,6 +69,27 @@ export async function ensureMealsSchema() {
     CREATE INDEX IF NOT EXISTS idx_ftn_daily_meals_user_day_mealtype
       ON public.ftn_daily_meals (user_id, day, meal_type);
   `);
+
+  // Targets table (idempotent)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.ftn_daily_targets (
+      id BIGSERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      day DATE NOT NULL DEFAULT CURRENT_DATE,
+      bmi NUMERIC(5,2),
+      calories_target INT,
+      protein_g_target INT,
+      carbs_g_target INT,
+      fat_g_target INT,
+      fiber_g_target INT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE (user_id, day)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_ftn_daily_targets_user_day
+      ON public.ftn_daily_targets (user_id, day);
+  `);
 }
 
 /* ===================== BMI → targets ===================== */
@@ -88,23 +109,74 @@ function targetsFromBMI(bmi) {
   };
 }
 
-/* ===================== Update flag per user/day ===================== */
-async function updateDailyCompletion(user_id, day) {
-  const { rows: prof } = await pool.query(
-    `SELECT bmi FROM public.ftn_profiles WHERE user_id = $1 LIMIT 1`,
+/* ===================== Profile BMI + Targets helpers ===================== */
+async function getProfileBMI(user_id) {
+  const { rows } = await pool.query(
+    `SELECT bmi, height_cm, weight_kg FROM public.ftn_profiles WHERE user_id=$1 LIMIT 1`,
     [user_id]
   );
-  const bmi = prof[0]?.bmi == null ? null : Number(prof[0].bmi);
-  const targets = targetsFromBMI(bmi);
+  const p = rows[0];
+  if (!p) return null;
+  if (p.bmi != null) return Number(p.bmi);
 
+  const h = p.height_cm ? Number(p.height_cm) : null;
+  const w = p.weight_kg ? Number(p.weight_kg) : null;
+  if (h && w && h > 0) {
+    const m = h / 100;
+    return +(w / (m * m)).toFixed(2);
+  }
+  return null;
+}
+
+async function upsertDailyTargets(user_id, day, bmi, targ) {
+  await pool.query(
+    `INSERT INTO public.ftn_daily_targets
+      (user_id, day, bmi, calories_target, protein_g_target, carbs_g_target, fat_g_target, fiber_g_target)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+     ON CONFLICT (user_id, day) DO UPDATE SET
+       bmi=$3,
+       calories_target=$4,
+       protein_g_target=$5,
+       carbs_g_target=$6,
+       fat_g_target=$7,
+       fiber_g_target=$8,
+       updated_at=NOW()`,
+    [
+      user_id, day, bmi,
+      targ.calories ?? null,
+      targ.protein_g ?? null,
+      targ.carbs_g ?? null,
+      targ.fat_g ?? null,
+      targ.fiber_g ?? null
+    ]
+  );
+}
+
+/* ===================== Update flag per user/day ===================== */
+async function updateDailyCompletion(user_id, day) {
+  // 1) Prefer stored targets for that day; fallback to BMI rule
+  const { rows: trow } = await pool.query(
+    `SELECT calories_target FROM public.ftn_daily_targets WHERE user_id=$1 AND day=$2 LIMIT 1`,
+    [user_id, day]
+  );
+  let calTarget = trow[0]?.calories_target ?? null;
+
+  if (calTarget == null) {
+    const bmi = await getProfileBMI(user_id);
+    const t = targetsFromBMI(bmi);
+    calTarget = t.calories;
+  }
+
+  // 2) Compute consumed
   const { rows } = await pool.query(
     `SELECT COALESCE(SUM(calories)::int,0) AS total_calories
      FROM public.ftn_daily_meals WHERE user_id=$1 AND day=$2`,
     [user_id, day]
   );
   const consumed = Number(rows[0]?.total_calories || 0);
-  const done = targets.calories != null && consumed >= targets.calories;
+  const done = calTarget != null && consumed >= calTarget;
 
+  // 3) Update flag across rows for the day
   await pool.query(
     `UPDATE public.ftn_daily_meals
      SET is_completed = $3, updated_at = NOW()
@@ -116,7 +188,6 @@ async function updateDailyCompletion(user_id, day) {
 /* ===================== CRUD (user-scoped) ===================== */
 
 // POST /meals   (multipart with optional image)
-// Stores image at: fitness/users/<uid>/meals/meal_<id>/...
 export async function createDailyMeal(req, res, next) {
   try {
     await ensureMealsSchema();
@@ -333,12 +404,31 @@ export async function dailyStatus(req, res, next) {
     if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
     if (!day) return res.status(400).json({ hasError: true, message: "day is required (YYYY-MM-DD)" });
 
-    const { rows: prof } = await pool.query(
-      `SELECT bmi FROM public.ftn_profiles WHERE user_id = $1 LIMIT 1`,
-      [user_id]
+    // Prefer existing stored targets for that day
+    const { rows: t } = await pool.query(
+      `SELECT calories_target, protein_g_target, carbs_g_target, fat_g_target, fiber_g_target
+         FROM public.ftn_daily_targets WHERE user_id=$1 AND day=$2 LIMIT 1`,
+      [user_id, day]
     );
-    const bmi = prof[0]?.bmi == null ? null : Number(prof[0].bmi);
-    const targets = targetsFromBMI(bmi);
+
+    let targets;
+    let bmi = null;
+    if (t[0]) {
+      targets = {
+        calories: t[0].calories_target,
+        protein_g: t[0].protein_g_target,
+        carbs_g: t[0].carbs_g_target,
+        fat_g: t[0].fat_g_target,
+        fiber_g: t[0].fiber_g_target,
+      };
+    } else {
+      const { rows: prof } = await pool.query(
+        `SELECT bmi FROM public.ftn_profiles WHERE user_id = $1 LIMIT 1`,
+        [user_id]
+      );
+      bmi = prof[0]?.bmi == null ? null : Number(prof[0].bmi);
+      targets = targetsFromBMI(bmi);
+    }
 
     const { rows } = await pool.query(
       `SELECT
@@ -426,6 +516,68 @@ export async function todayMeals(req, res, next) {
         fiber_g:   Number(totals.fiber_g || 0),
       },
       is_completed: !!totals.is_completed
+    });
+  } catch (e) { next(e); }
+}
+
+/* ===================== New API: compute + persist daily needs ===================== */
+// GET /meals/daily/needs?day=YYYY-MM-DD  (day optional; defaults to today)
+export async function dailyNeeds(req, res, next) {
+  try {
+    await ensureMealsSchema();
+    const user_id = req.user_id || req.user?.user_id;
+    if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
+
+    const day = req.query.day || new Date().toISOString().slice(0,10);
+
+    // 1) BMI from profile (or compute if missing)
+    const bmi = await getProfileBMI(user_id);
+
+    // 2) Targets from BMI
+    const targets = targetsFromBMI(bmi);
+
+    // 3) Persist per user/day
+    await upsertDailyTargets(user_id, day, bmi, targets);
+
+    // 4) Re-evaluate completion
+    await updateDailyCompletion(user_id, day);
+
+    // 5) Return payload (include consumed + completion %)
+    const { rows: crows } = await pool.query(
+      `SELECT
+         COALESCE(SUM(calories)::int, 0) AS calories,
+         COALESCE(SUM(protein_g), 0)     AS protein_g,
+         COALESCE(SUM(carbs_g), 0)       AS carbs_g,
+         COALESCE(SUM(fat_g), 0)         AS fat_g,
+         COALESCE(SUM(fiber_g), 0)       AS fiber_g,
+         BOOL_OR(is_completed)           AS is_completed
+       FROM public.ftn_daily_meals
+       WHERE user_id=$1 AND day=$2`,
+      [user_id, day]
+    );
+    const c = crows[0] || {};
+    const pct = (cons, targ) => (!targ || targ <= 0 ? null : +((Number(cons||0)/targ)*100).toFixed(1));
+
+    return res.json({
+      hasError: false,
+      day,
+      bmi,
+      targets,
+      consumed: {
+        calories: Number(c.calories || 0),
+        protein_g: Number(c.protein_g || 0),
+        carbs_g:   Number(c.carbs_g || 0),
+        fat_g:     Number(c.fat_g || 0),
+        fiber_g:   Number(c.fiber_g || 0),
+      },
+      completion: {
+        calories_pct: pct(c.calories, targets.calories),
+        protein_pct:  pct(c.protein_g, targets.protein_g),
+        carbs_pct:    pct(c.carbs_g,   targets.carbs_g),
+        fat_pct:      pct(c.fat_g,     targets.fat_g),
+        fiber_pct:    pct(c.fiber_g,   targets.fiber_g),
+      },
+      is_completed: !!c.is_completed
     });
   } catch (e) { next(e); }
 }
