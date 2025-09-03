@@ -27,6 +27,7 @@ import workoutRouter from "./routes/workout.js";
 import googlefitRouter from "./routes/googlefit.js";
 import healthySwapsRouter from "./routes/healthySwaps.js";
 import userPlansRouter from "./routes/userPlans.js";
+import trackRouter from "./routes/track.js";
 
 export const app = express();
 
@@ -81,6 +82,7 @@ app.use("/workout", workoutRouter);
 app.use("/googlefit", googlefitRouter);
 app.use("/healthy-swaps", healthySwapsRouter);
 app.use("/user-plans", userPlansRouter);
+app.use("/track", trackRouter);
 
 // Generic error handler
 app.use((err, req, res, next) => {

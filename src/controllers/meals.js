@@ -1,17 +1,15 @@
 import { pool } from "../db/pool.js";
 import crypto from "crypto";
-import { putObject, buildKey, presignGet } from "../utils/s3.js";
+import { putObject, presignGet } from "../utils/s3.js";
+import { mealImageKey } from "../utils/keys.js";
 
-/* ===================== S3 helpers ===================== */
+/* ===================== MIME → extension ===================== */
 const extFromMime = (m) =>
-  /png$/i.test(m) ? "png" :
-  /jpe?g$/i.test(m) ? "jpg" :
-  /webp$/i.test(m) ? "webp" :
-  /gif$/i.test(m) ? "gif" : "bin";
-
-const mealKeyForUser = (userId, filename) =>
-  // fitness/users/<uid>/meals/<file>
-  buildKey("users", String(userId), "meals", filename);
+  /png$/i.test(m)     ? "png"  :
+  /jpe?g$/i.test(m)   ? "jpg"  :
+  /webp$/i.test(m)    ? "webp" :
+  /gif$/i.test(m)     ? "gif"  :
+  /hei[cf]$/i.test(m) ? "heic" : "bin";
 
 /* ===================== Bootstrap: create/patch table ===================== */
 export async function ensureMealsSchema() {
@@ -115,28 +113,10 @@ async function updateDailyCompletion(user_id, day) {
   );
 }
 
-/* ===================== S3: photo-only upload ===================== */
-// POST /meals/photo  (multipart: image) → { key, url }
-export async function uploadMealImage(req, res, next) {
-  try {
-    const user_id = req.user_id || req.user?.user_id;
-    if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
-    if (!req.file) return res.status(400).json({ hasError: true, message: "image is required (field: image)" });
-
-    const ext  = extFromMime(req.file.mimetype);
-    const name = `${Date.now()}_${crypto.randomBytes(4).toString("hex")}.${ext}`;
-    const Key  = mealKeyForUser(user_id, name);
-
-    await putObject({ Key, Body: req.file.buffer, ContentType: req.file.mimetype });
-    const url = await presignGet(Key, 3600);
-
-    res.json({ hasError: false, key: Key, url, size: req.file.size, contentType: req.file.mimetype });
-  } catch (e) { next(e); }
-}
-
 /* ===================== CRUD (user-scoped) ===================== */
 
-// POST /meals   (supports multipart with optional image)
+// POST /meals   (multipart with optional image)
+// Stores image at: fitness/users/<uid>/meals/meal_<id>/...
 export async function createDailyMeal(req, res, next) {
   try {
     await ensureMealsSchema();
@@ -146,35 +126,43 @@ export async function createDailyMeal(req, res, next) {
     const {
       day = null, meal_type = null, food_name,
       amount = null, unit = null,
-      calories = null, protein_g = null, carbs_g = null, fat_g = null, fiber_g = null,
-      image_s3_key: bodyKey = null
+      calories = null, protein_g = null, carbs_g = null, fat_g = null, fiber_g = null
     } = req.body || {};
     if (!food_name?.trim()) return res.status(400).json({ hasError: true, message: "food_name is required" });
 
-    // if a file is attached, upload it and use that key
-    let image_s3_key = bodyKey;
+    // 1) Insert row without image to get id
+    const { rows: ins } = await pool.query(
+      `INSERT INTO public.ftn_daily_meals
+        (user_id, day, meal_type, food_name, amount, unit, calories, protein_g, carbs_g, fat_g, fiber_g)
+       VALUES ($1, COALESCE($2, CURRENT_DATE), $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       RETURNING *`,
+      [user_id, day, meal_type, food_name.trim(), amount, unit, calories, protein_g, carbs_g, fat_g, fiber_g]
+    );
+
+    let data = ins[0];
+
+    // 2) If image provided, upload under meal_<id>
     if (req.file) {
       const ext  = extFromMime(req.file.mimetype);
       const name = `${Date.now()}_${crypto.randomBytes(4).toString("hex")}.${ext}`;
-      const Key  = mealKeyForUser(user_id, name);
+      const Key  = mealImageKey({ userId: user_id, mealId: data.id, filename: name });
+
       await putObject({ Key, Body: req.file.buffer, ContentType: req.file.mimetype });
-      image_s3_key = Key;
+
+      const { rows: upd } = await pool.query(
+        `UPDATE public.ftn_daily_meals
+         SET image_s3_key = $1, updated_at = NOW()
+         WHERE id = $2 AND user_id = $3
+         RETURNING *`,
+        [Key, data.id, user_id]
+      );
+      data = upd[0];
     }
 
-    const { rows } = await pool.query(
-      `INSERT INTO public.ftn_daily_meals
-         (user_id, day, meal_type, food_name, amount, unit, calories, protein_g, carbs_g, fat_g, fiber_g, image_s3_key)
-       VALUES ($1, COALESCE($2, CURRENT_DATE), $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-       RETURNING *`,
-      [user_id, day, meal_type, food_name.trim(), amount, unit, calories, protein_g, carbs_g, fat_g, fiber_g, image_s3_key]
-    );
-
-    await updateDailyCompletion(user_id, rows[0].day);
-
-    const data = rows[0];
+    await updateDailyCompletion(user_id, data.day);
     if (data.image_s3_key) data.image_url = await presignGet(data.image_s3_key, 3600);
 
-    res.json({ hasError: false, data });
+    return res.json({ hasError: false, data });
   } catch (e) { next(e); }
 }
 
@@ -198,9 +186,9 @@ export async function listDailyMeals(req, res, next) {
     sql += ` ORDER BY day DESC, created_at DESC LIMIT 200`;
 
     const { rows } = await pool.query(sql, params);
-    for (const r of rows) {
+    await Promise.all(rows.map(async r => {
       if (r.image_s3_key) r.image_url = await presignGet(r.image_s3_key, 3600);
-    }
+    }));
     res.json({ hasError: false, data: rows });
   } catch (e) { next(e); }
 }
@@ -225,7 +213,7 @@ export async function getDailyMeal(req, res, next) {
   } catch (e) { next(e); }
 }
 
-// PUT /meals/:id   (supports multipart with optional image)
+// PUT /meals/:id   (multipart with optional image)
 export async function updateDailyMeal(req, res, next) {
   try {
     await ensureMealsSchema();
@@ -233,18 +221,18 @@ export async function updateDailyMeal(req, res, next) {
     const { id } = req.params;
     if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
 
-    const fields = ["day","meal_type","food_name","amount","unit","calories","protein_g","carbs_g","fat_g","fiber_g","image_s3_key"];
-    const sets = [];
-    const vals = [id, user_id];
-
-    // file uploaded -> upload to S3 and set image_s3_key
+    // If new image uploaded, store under meal_<id>
     if (req.file) {
       const ext  = extFromMime(req.file.mimetype);
       const name = `${Date.now()}_${crypto.randomBytes(4).toString("hex")}.${ext}`;
-      const Key  = mealKeyForUser(user_id, name);
+      const Key  = mealImageKey({ userId: user_id, mealId: id, filename: name });
       await putObject({ Key, Body: req.file.buffer, ContentType: req.file.mimetype });
       req.body.image_s3_key = Key;
     }
+
+    const fields = ["day","meal_type","food_name","amount","unit","calories","protein_g","carbs_g","fat_g","fiber_g","image_s3_key"];
+    const sets = [];
+    const vals = [id, user_id];
 
     for (const f of fields) {
       if (Object.prototype.hasOwnProperty.call(req.body || {}, f)) {
@@ -408,9 +396,9 @@ export async function todayMeals(req, res, next) {
       [user_id]
     );
 
-    for (const m of meals) {
+    await Promise.all(meals.map(async m => {
       if (m.image_s3_key) m.image_url = await presignGet(m.image_s3_key, 3600);
-    }
+    }));
 
     const { rows: totalsRows } = await pool.query(
       `SELECT

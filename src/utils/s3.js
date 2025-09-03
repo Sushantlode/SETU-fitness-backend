@@ -1,4 +1,4 @@
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 const region = process.env.AWS_REGION || "ap-south-1";
@@ -23,4 +23,10 @@ export async function presignGet(key, expires = 3600) {
   if (!key) throw new Error("key is required");
   const command = new GetObjectCommand({ Bucket, Key: key });
   return getSignedUrl(s3Client, command, { expiresIn: Number(expires) });
+}
+
+export async function headObject(key) {
+  if (!Bucket) throw new Error("S3_BUCKET not set");
+  if (!key) throw new Error("key is required");
+  return s3Client.send(new HeadObjectCommand({ Bucket, Key: key }));
 }
