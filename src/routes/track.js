@@ -1,35 +1,40 @@
-import { Router } from "express";
-import {
-  createTrack,
-  getTrackByDay,
-  listTracks,
-  putTrackForDay,
-  patchTrackForDay,
-  deleteTrackByDay,
-  putSteps,
-  putDistance,
-  putCalories,
-} from "../controllers/track.js";
+    import { Router } from "express";
+    import { authenticateJWT } from "../middleware/auth.js";
+    import {
+    createOrUpsertTrack,
+    listRange,
+    getOneDay,
+    replaceDay,
+    patchDay,
+    deleteDay,
+    updateSteps,
+    updateDistance,
+    updateCalories,
+    updateStepsLive,
+    patchMetrics
+    } from "../controllers/track.js";
 
-const r = Router();
+    const r = Router();
+    r.use(authenticateJWT);
 
-// CREATE
-r.post("/", createTrack);                     // POST /track
+    // collection routes at /track  (mounted with app.use("/track", r))
+    r.post("/", createOrUpsertTrack);     // create/upsert by day (body.day optional)
+    r.get("/", listRange);                // ?start&end
 
-// READ
-r.get("/", listTracks);                       // GET /track?start=&end=&page=&limit=
-r.get("/:day", getTrackByDay);                // GET /track/2025-09-03
+    // single-field + live rollover (declare before :day)
+    r.put("/steps", updateSteps);
+    r.put("/steps/live", updateStepsLive); // optional
+    r.put("/distance", updateDistance);
+    r.put("/calories", updateCalories);
 
-// UPDATE (replace / partial)
-r.put("/:day", putTrackForDay);               // PUT /track/2025-09-03
-r.patch("/:day", patchTrackForDay);           // PATCH /track/2025-09-03
+    // combined patch for steps/distance/calories
+    r.patch("/metrics", patchMetrics);
 
-// DELETE
-r.delete("/:day", deleteTrackByDay);          // DELETE /track/2025-09-03
+    // item routes by :day
+    r.route("/:day")
+    .get(getOneDay)
+    .put(replaceDay)
+    .patch(patchDay)
+    .delete(deleteDay);
 
-// Convenience single-metric PUTs (overwrite that field only)
-r.put("/steps", putSteps);                    // body: { day?, steps }
-r.put("/distance", putDistance);              // body: { day?, distance_m }
-r.put("/calories", putCalories);              // body: { day?, calories_kcal }
-
-export default r;
+    export default r;
