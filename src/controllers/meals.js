@@ -1,5 +1,17 @@
-// src/controllers/meals.js
 import { pool } from "../db/pool.js";
+import crypto from "crypto";
+import { putObject, buildKey, presignGet } from "../utils/s3.js";
+
+/* ===================== S3 helpers ===================== */
+const extFromMime = (m) =>
+  /png$/i.test(m) ? "png" :
+  /jpe?g$/i.test(m) ? "jpg" :
+  /webp$/i.test(m) ? "webp" :
+  /gif$/i.test(m) ? "gif" : "bin";
+
+const mealKeyForUser = (userId, filename) =>
+  // fitness/users/<uid>/meals/<file>
+  buildKey("users", String(userId), "meals", filename);
 
 /* ===================== Bootstrap: create/patch table ===================== */
 export async function ensureMealsSchema() {
@@ -41,7 +53,6 @@ export async function ensureMealsSchema() {
       IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='fiber_g')
       THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN fiber_g NUMERIC(10,2); END IF;
 
-      /* NEW: S3 image key/url per meal */
       IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='ftn_daily_meals' AND column_name='image_s3_key')
       THEN ALTER TABLE public.ftn_daily_meals ADD COLUMN image_s3_key TEXT; END IF;
 
@@ -104,22 +115,51 @@ async function updateDailyCompletion(user_id, day) {
   );
 }
 
+/* ===================== S3: photo-only upload ===================== */
+// POST /meals/photo  (multipart: image) → { key, url }
+export async function uploadMealImage(req, res, next) {
+  try {
+    const user_id = req.user_id || req.user?.user_id;
+    if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
+    if (!req.file) return res.status(400).json({ hasError: true, message: "image is required (field: image)" });
+
+    const ext  = extFromMime(req.file.mimetype);
+    const name = `${Date.now()}_${crypto.randomBytes(4).toString("hex")}.${ext}`;
+    const Key  = mealKeyForUser(user_id, name);
+
+    await putObject({ Key, Body: req.file.buffer, ContentType: req.file.mimetype });
+    const url = await presignGet(Key, 3600);
+
+    res.json({ hasError: false, key: Key, url, size: req.file.size, contentType: req.file.mimetype });
+  } catch (e) { next(e); }
+}
+
 /* ===================== CRUD (user-scoped) ===================== */
 
-// POST /meals
+// POST /meals   (supports multipart with optional image)
 export async function createDailyMeal(req, res, next) {
   try {
     await ensureMealsSchema();
-    const user_id = req.user_id;
+    const user_id = req.user_id || req.user?.user_id;
     if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
 
     const {
       day = null, meal_type = null, food_name,
       amount = null, unit = null,
       calories = null, protein_g = null, carbs_g = null, fat_g = null, fiber_g = null,
-      image_s3_key = null                 // << NEW
+      image_s3_key: bodyKey = null
     } = req.body || {};
     if (!food_name?.trim()) return res.status(400).json({ hasError: true, message: "food_name is required" });
+
+    // if a file is attached, upload it and use that key
+    let image_s3_key = bodyKey;
+    if (req.file) {
+      const ext  = extFromMime(req.file.mimetype);
+      const name = `${Date.now()}_${crypto.randomBytes(4).toString("hex")}.${ext}`;
+      const Key  = mealKeyForUser(user_id, name);
+      await putObject({ Key, Body: req.file.buffer, ContentType: req.file.mimetype });
+      image_s3_key = Key;
+    }
 
     const { rows } = await pool.query(
       `INSERT INTO public.ftn_daily_meals
@@ -130,7 +170,11 @@ export async function createDailyMeal(req, res, next) {
     );
 
     await updateDailyCompletion(user_id, rows[0].day);
-    res.json({ hasError: false, data: rows[0] });
+
+    const data = rows[0];
+    if (data.image_s3_key) data.image_url = await presignGet(data.image_s3_key, 3600);
+
+    res.json({ hasError: false, data });
   } catch (e) { next(e); }
 }
 
@@ -138,7 +182,7 @@ export async function createDailyMeal(req, res, next) {
 export async function listDailyMeals(req, res, next) {
   try {
     await ensureMealsSchema();
-    const user_id = req.user_id;
+    const user_id = req.user_id || req.user?.user_id;
     if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
 
     const { day } = req.query;
@@ -154,6 +198,9 @@ export async function listDailyMeals(req, res, next) {
     sql += ` ORDER BY day DESC, created_at DESC LIMIT 200`;
 
     const { rows } = await pool.query(sql, params);
+    for (const r of rows) {
+      if (r.image_s3_key) r.image_url = await presignGet(r.image_s3_key, 3600);
+    }
     res.json({ hasError: false, data: rows });
   } catch (e) { next(e); }
 }
@@ -162,7 +209,7 @@ export async function listDailyMeals(req, res, next) {
 export async function getDailyMeal(req, res, next) {
   try {
     await ensureMealsSchema();
-    const user_id = req.user_id;
+    const user_id = req.user_id || req.user?.user_id;
     const { id } = req.params;
     if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
 
@@ -171,21 +218,33 @@ export async function getDailyMeal(req, res, next) {
       [id, user_id]
     );
     if (!rows[0]) return res.status(404).json({ hasError: true, message: "Not found" });
-    res.json({ hasError: false, data: rows[0] });
+
+    const meal = rows[0];
+    if (meal.image_s3_key) meal.image_url = await presignGet(meal.image_s3_key, 3600);
+    res.json({ hasError: false, data: meal });
   } catch (e) { next(e); }
 }
 
-// PUT /meals/:id
+// PUT /meals/:id   (supports multipart with optional image)
 export async function updateDailyMeal(req, res, next) {
   try {
     await ensureMealsSchema();
-    const user_id = req.user_id;
+    const user_id = req.user_id || req.user?.user_id;
     const { id } = req.params;
     if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
 
     const fields = ["day","meal_type","food_name","amount","unit","calories","protein_g","carbs_g","fat_g","fiber_g","image_s3_key"];
     const sets = [];
     const vals = [id, user_id];
+
+    // file uploaded -> upload to S3 and set image_s3_key
+    if (req.file) {
+      const ext  = extFromMime(req.file.mimetype);
+      const name = `${Date.now()}_${crypto.randomBytes(4).toString("hex")}.${ext}`;
+      const Key  = mealKeyForUser(user_id, name);
+      await putObject({ Key, Body: req.file.buffer, ContentType: req.file.mimetype });
+      req.body.image_s3_key = Key;
+    }
 
     for (const f of fields) {
       if (Object.prototype.hasOwnProperty.call(req.body || {}, f)) {
@@ -205,7 +264,11 @@ export async function updateDailyMeal(req, res, next) {
     if (!rows[0]) return res.status(404).json({ hasError: true, message: "Not found" });
 
     await updateDailyCompletion(user_id, rows[0].day);
-    res.json({ hasError: false, data: rows[0] });
+
+    const data = rows[0];
+    if (data.image_s3_key) data.image_url = await presignGet(data.image_s3_key, 3600);
+
+    res.json({ hasError: false, data });
   } catch (e) { next(e); }
 }
 
@@ -213,7 +276,7 @@ export async function updateDailyMeal(req, res, next) {
 export async function deleteDailyMeal(req, res, next) {
   try {
     await ensureMealsSchema();
-    const user_id = req.user_id;
+    const user_id = req.user_id || req.user?.user_id;
     const { id } = req.params;
     if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
 
@@ -241,7 +304,7 @@ export async function deleteDailyMeal(req, res, next) {
 export async function dailyConsumed(req, res, next) {
   try {
     await ensureMealsSchema();
-    const user_id = req.user_id;
+    const user_id = req.user_id || req.user?.user_id;
     const day = req.query.day;
     if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
     if (!day) return res.status(400).json({ hasError: true, message: "day is required (YYYY-MM-DD)" });
@@ -277,7 +340,7 @@ export async function dailyConsumed(req, res, next) {
 export async function dailyStatus(req, res, next) {
   try {
     await ensureMealsSchema();
-    const user_id = req.user_id;
+    const user_id = req.user_id || req.user?.user_id;
     const day = req.query.day;
     if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
     if (!day) return res.status(400).json({ hasError: true, message: "day is required (YYYY-MM-DD)" });
@@ -332,7 +395,7 @@ export async function dailyStatus(req, res, next) {
 export async function todayMeals(req, res, next) {
   try {
     await ensureMealsSchema();
-    const user_id = req.user_id;
+    const user_id = req.user_id || req.user?.user_id;
     if (!user_id) return res.status(401).json({ hasError: true, message: "unauthorized" });
 
     const { rows: meals } = await pool.query(
@@ -344,6 +407,10 @@ export async function todayMeals(req, res, next) {
        ORDER BY created_at DESC`,
       [user_id]
     );
+
+    for (const m of meals) {
+      if (m.image_s3_key) m.image_url = await presignGet(m.image_s3_key, 3600);
+    }
 
     const { rows: totalsRows } = await pool.query(
       `SELECT

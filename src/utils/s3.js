@@ -15,7 +15,7 @@ export async function putObject({ Key, Body, ContentType, CacheControl = "public
   if (!Bucket) throw new Error("S3_BUCKET not set");
   if (!Key) throw new Error("Key is required");
   await s3Client.send(new PutObjectCommand({ Bucket, Key, Body, ContentType, CacheControl }));
-  return Key; // we store this in DB
+  return Key;
 }
 
 export async function presignGet(key, expires = 3600) {
