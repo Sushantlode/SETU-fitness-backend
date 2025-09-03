@@ -20,7 +20,9 @@ const normDay = (s) => {
 
 // YYYY-MM-DD in a TZ (default IST)
 function dayInTz(tsMs = Date.now(), tz = "Asia/Kolkata") {
-  const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit"
+  });
   return fmt.format(new Date(tsMs));
 }
 
@@ -413,5 +415,62 @@ export async function patchMetrics(req, res, next) {
     );
 
     res.json({ hasError: false, data: rows[0] });
+  } catch (e) { next(e); }
+}
+
+/* ========= NEW: daily steps goal from BMI + goal status =========
+   GET /track/steps/needed[?day=YYYY-MM-DD]
+*/
+export async function getDailyNeededSteps(req, res, next) {
+  try {
+    const userPk = await resolveProfileUuid(req.user_id ?? req.user?.user_id);
+    if (!userPk) return res.status(401).json({ hasError: true, message: "unknown user (no profile)" });
+
+    // day param optional, defaults to "today" in IST
+    const dayParam = typeof req.query?.day === "string" ? req.query.day : null;
+    const day = dayParam ? (normDay(dayParam) || dayInTz()) : dayInTz();
+
+    // fetch BMI + actual steps for that day
+    const { rows } = await pool.query(
+      `SELECT p.id, p.bmi, COALESCE(t.steps, 0) AS actual_steps
+         FROM public.ftn_profiles p
+         LEFT JOIN public.fit_daily_tracks t
+           ON t.user_id = p.id AND t.day = $2::date
+        WHERE p.id = $1::uuid
+        LIMIT 1`,
+      [userPk, day]
+    );
+
+    const r = rows[0];
+    if (!r) return res.status(401).json({ hasError: true, message: "unknown user (no profile)" });
+
+    const bmiNum = r.bmi == null ? null : Number(r.bmi);
+    if (!Number.isFinite(bmiNum)) {
+      return res.status(400).json({ hasError: true, message: "bmi missing on profile" });
+    }
+
+    // bmi-bands-v1 mapping
+    let bmi_band, recommended_steps;
+    if (bmiNum < 18.5) { bmi_band = "underweight"; recommended_steps = 8000; }
+    else if (bmiNum < 25) { bmi_band = "normal"; recommended_steps = 9000; }
+    else if (bmiNum < 30) { bmi_band = "overweight"; recommended_steps = 11000; }
+    else { bmi_band = "obese"; recommended_steps = 12000; }
+
+    const actual_steps = Math.max(0, parseInt(r.actual_steps, 10) || 0);
+    const goal_completed = actual_steps >= recommended_steps;
+
+    return res.json({
+      hasError: false,
+      data: {
+        user_id: userPk,
+        day,
+        bmi: Number(bmiNum.toFixed(2)),
+        bmi_band,
+        recommended_steps,
+        actual_steps,
+        goal_completed,
+        rule: "bmi-bands-v1"
+      }
+    });
   } catch (e) { next(e); }
 }
