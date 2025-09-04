@@ -4,25 +4,29 @@ import * as ctrl from "../controllers/profiles.js";
 
 const r = Router();
 
-// Upload (multipart/form-data; field name: "image")
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    if (/^image\/(png|jpe?g|webp|gif)$/i.test(file.mimetype)) return cb(null, true);
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
+  fileFilter: (_req, file, cb) => {
+    if (/^image\/(png|jpe?g|webp|gif|heic|heif)$/i.test(file.mimetype)) return cb(null, true);
     cb(new Error("ONLY_IMAGES"));
   },
 });
+
+// Upload photo only (already existed)
 r.post("/photo", upload.single("image"), ctrl.uploadProfilePhoto);
 
-// Old paths preserved
+// CREATE PROFILE — now accepts multipart with "image" + text fields
+r.post("/", upload.single("image"), ctrl.createProfile);
+
+// You can keep PUT/PATCH JSON-only, or also enable multipart similarly if you want:
+r.put("/", ctrl.upsertProfile);
+r.patch("/", ctrl.patchProfile);
+
 r.get("/",    ctrl.getProfile);
-r.post("/",   ctrl.createProfile);
-r.put("/",    ctrl.upsertProfile);
-r.patch("/",  ctrl.patchProfile);
 r.delete("/", ctrl.deleteProfile);
 
-// Friendly aliases
+// Aliases
 r.get("/me",    ctrl.getProfile);
 r.put("/me",    ctrl.upsertProfile);
 r.patch("/me",  ctrl.patchProfile);

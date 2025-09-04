@@ -28,6 +28,10 @@ import googlefitRouter from "./routes/googlefit.js";
 import healthySwapsRouter from "./routes/healthySwaps.js";
 import userPlansRouter from "./routes/userPlans.js";
 import trackRouter from "./routes/track.js";
+// app.js (or wherever you mount)
+import workoutDailyRoutes from "./routes/workout_daily.js";
+
+
 
 export const app = express();
 
@@ -78,14 +82,17 @@ app.use("/meal-plans", mealPlansRouter);
 app.use("/swaps", swapsRouter);
 app.use("/motivations", motivationsRouter);
 app.use("/images", imagesRouter);
-app.use("/workout", workoutRouter);
+app.use("/workout", authenticateJWT , workoutRouter);
 app.use("/googlefit", googlefitRouter);
 app.use("/healthy-swaps", healthySwapsRouter);
 app.use("/user-plans", userPlansRouter);
 app.use("/track", trackRouter);
+app.use("/workout", authenticateJWT , workoutDailyRoutes);
 
 // Generic error handler
 app.use((err, req, res, next) => {
   console.error(err);
   res.status(err.status || 500).json({ hasError: true, message: err.message || "Internal error" });
 });
+
+

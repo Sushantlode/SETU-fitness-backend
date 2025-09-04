@@ -6,18 +6,18 @@ import axios from "axios";
  * - Verifies access JWT with JWT_SECRET
  * - If expired and X-Refresh-Token exists -> calls REFRESH_TOKEN_URL to mint new pair
  * - Sets headers: Authorization: Bearer <new>, X-Refresh-Token: <new>
- * - Populates req.user and req.user_id (backward-compatible)
+ * - Populates req.user and req.user_id (string)
  */
 export async function authenticateJWT(req, res, next) {
   const auth = req.headers.authorization || req.headers.Authorization || "";
-  const [, token] = auth.split(" ");
+  const [scheme, token] = auth.split(" ");
   const refresh =
     req.headers["x-refresh-token"] ||
     req.headers["X-Refresh-Token"] ||
     req.headers["x-refresh"] ||
     null;
 
-  if (!token) {
+  if (!token || !/^Bearer$/i.test(scheme)) {
     return res.status(401).json({
       hasError: true,
       code: "MISSING_ACCESS_TOKEN",
@@ -27,8 +27,9 @@ export async function authenticateJWT(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const userId = decoded.user_id ?? decoded.userId ?? decoded.id;
-    if (!userId) {
+    const rawUserId =
+      decoded.user_id ?? decoded.userId ?? decoded.id ?? decoded.sub; // ← include sub
+    if (rawUserId === undefined || rawUserId === null || String(rawUserId).trim() === "") {
       return res.status(401).json({
         hasError: true,
         code: "INVALID_PAYLOAD",
@@ -36,7 +37,7 @@ export async function authenticateJWT(req, res, next) {
       });
     }
     req.user = decoded;
-    req.user_id = userId;
+    req.user_id = String(rawUserId); // ← always string
     return next();
   } catch (err) {
     if (err.name === "TokenExpiredError") {
@@ -57,12 +58,8 @@ export async function authenticateJWT(req, res, next) {
           });
         }
 
-        // Call your refresh endpoint
-        const resp = await axios.post(process.env.REFRESH_TOKEN_URL, {
-          refreshToken: refresh,
-        });
+        const resp = await axios.post(process.env.REFRESH_TOKEN_URL, { refreshToken: refresh });
 
-        // Be tolerant to response shapes
         const accessToken =
           resp.data?.accessToken ||
           resp.data?.token ||
@@ -74,14 +71,13 @@ export async function authenticateJWT(req, res, next) {
 
         if (!accessToken) throw new Error("No accessToken in refresh response");
 
-        // Send new tokens to client (CORS must expose these; you already do)
         res.setHeader("Authorization", `Bearer ${accessToken}`);
         if (newRefreshToken) res.setHeader("X-Refresh-Token", newRefreshToken);
 
-        // Trust the new token
         const decodedNew = jwt.verify(accessToken, process.env.JWT_SECRET);
-        const userId = decodedNew.user_id ?? decodedNew.userId ?? decodedNew.id;
-        if (!userId) {
+        const rawUserIdNew =
+          decodedNew.user_id ?? decodedNew.userId ?? decodedNew.id ?? decodedNew.sub; // ← include sub
+        if (rawUserIdNew === undefined || rawUserIdNew === null || String(rawUserIdNew).trim() === "") {
           return res.status(401).json({
             hasError: true,
             code: "INVALID_PAYLOAD",
@@ -89,19 +85,17 @@ export async function authenticateJWT(req, res, next) {
           });
         }
         req.user = decodedNew;
-        req.user_id = userId;
+        req.user_id = String(rawUserIdNew); // ← always string
         return next();
       } catch (e) {
         return res.status(401).json({
           hasError: true,
           code: "REFRESH_FAILED",
-          message:
-            e?.response?.data?.message || e.message || "Failed to refresh token",
+          message: e?.response?.data?.message || e.message || "Failed to refresh token",
         });
       }
     }
 
-    // Bad signature / malformed
     return res.status(401).json({
       hasError: true,
       code: "INVALID_TOKEN",
