@@ -2,6 +2,8 @@
 import express from "express";
 import morgan from "morgan";
 import cors from "cors";
+import { sequelize } from './db/pool.js';
+import './models/index.js';                 // <-- init associations here
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -26,7 +28,8 @@ import imagesRouter from "./routes/images.js";
 import workoutRouter from "./routes/workout.js";
 import googlefitRouter from "./routes/googlefit.js";
 import healthySwapsRouter from "./routes/healthySwaps.js";
-import userPlansRouter from "./routes/userPlans.js";
+
+import userPlansRouter from './routes/userPlans.js';
 import trackRouter from "./routes/track.js";
 // app.js (or wherever you mount)
 import workoutDailyRoutes from "./routes/workout_daily.js";

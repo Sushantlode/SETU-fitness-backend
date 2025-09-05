@@ -1,163 +1,179 @@
-import { Op } from 'sequelize';
-import UserPlan from '../models/UserPlan.js';
-import HealthySwap from '../models/HealthySwap.js';
+// src/controllers/userPlans.js
+import { pool } from '../db/pool.js';
 
-export const addToPlan = async (req, res) => {
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+// resolve caller → ftn_profiles.id (UUID). Accepts:
+//  - X-Profile-Id header (UUID)  [use this for testing]
+//  - req.profile_id (UUID)
+//  - req.user_id / req.user.user_id (string/int) → maps via ftn_profiles.user_id
+async function resolveProfileUuid(req) {
+  const hdr = (req.get('X-Profile-Id') || '').trim();
+  if (hdr && /^[0-9a-f-]{36}$/i.test(hdr)) return hdr;
+
+  const cand = String(req.profile_id ?? req.user_id ?? req.user?.user_id ?? req.user?.id ?? '').trim();
+  if (!cand) return null;
+
+  const { rows } = await pool.query(
+    `SELECT id
+       FROM ftn_profiles
+      WHERE id::text = $1 OR user_id::text = $1
+      LIMIT 1`,
+    [cand]
+  );
+  return rows[0]?.id || null;
+}
+
+/** POST /user-plans { swapId, scheduledDate (YYYY-MM-DD), isCompleted? } */
+export async function addToPlan(req, res) {
   try {
-    const { swapId, scheduledDate } = req.body;
-    const userId = req.user_id; // From auth middleware
+    const profileId = await resolveProfileUuid(req);
+    if (!profileId) return res.status(401).json({ hasError: true, message: 'unknown profile' });
 
-    // Check if the swap exists
-    const swap = await HealthySwap.findByPk(swapId);
-    if (!swap) {
-      return res.status(404).json({
-        hasError: true,
-        message: 'Healthy swap not found',
-      });
-    }
+    const { swapId, scheduledDate, isCompleted } = req.body || {};
+    if (!Number.isInteger(swapId)) return res.status(400).json({ hasError: true, message: 'swapId (int) required' });
+    if (!DAY_RE.test(String(scheduledDate))) return res.status(400).json({ hasError: true, message: 'scheduledDate must be YYYY-MM-DD' });
 
-    // Check if already in plan for the same date
-    const existingPlan = await UserPlan.findOne({
-      where: {
-        userId,
-        swapId,
-        scheduledDate,
-      },
-    });
+    // ensure swap exists & active
+    const s = await pool.query(`SELECT 1 FROM healthy_swaps WHERE id=$1 AND is_active=TRUE`, [swapId]);
+    if (!s.rows[0]) return res.status(404).json({ hasError: true, message: 'swap not found or inactive' });
 
-    if (existingPlan) {
-      return res.status(400).json({
-        hasError: true,
-        message: 'This swap is already in your plan for the selected date',
-      });
-    }
+    const ins = await pool.query(
+      `INSERT INTO user_plans (user_id, swap_id, scheduled_date, is_completed)
+       VALUES ($1::uuid, $2::int, $3::date, COALESCE($4::boolean,FALSE))
+       ON CONFLICT (user_id, scheduled_date, swap_id)
+       DO UPDATE SET is_completed = EXCLUDED.is_completed, updated_at = NOW()
+       RETURNING id`,
+      [profileId, swapId, scheduledDate, isCompleted]
+    );
+    const planId = ins.rows[0].id;
 
-    const plan = await UserPlan.create({
-      userId,
-      swapId,
-      scheduledDate,
-      isCompleted: false,
-    });
-
-    res.status(201).json({
-      hasError: false,
-      message: 'Added to your plan successfully',
-      data: plan,
-    });
-  } catch (error) {
-    console.error('Error adding to plan:', error);
-    res.status(500).json({
-      hasError: true,
-      message: 'Failed to add to plan',
-      error: error.message,
-    });
+    const { rows } = await pool.query(
+      `SELECT up.id, up.user_id, up.scheduled_date, up.is_completed,
+              hs.id AS swap_id, hs.category, hs.unhealthy_item, hs.healthy_alternative,
+              hs.calories_saved, hs.image_url, hs.benefits
+         FROM user_plans up
+         JOIN healthy_swaps hs ON hs.id = up.swap_id
+        WHERE up.id = $1::bigint`,
+      [planId]
+    );
+    return res.json({ hasError: false, data: rows[0] });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ hasError: true, message: 'Failed to add to plan' });
   }
-};
+}
 
-export const getUserPlans = async (req, res) => {
+/** GET /user-plans?day=YYYY-MM-DD | ?start=YYYY-MM-DD&end=YYYY-MM-DD&page=1&limit=20 */
+export async function getUserPlans(req, res) {
   try {
-    const userId = req.user_id;
-    const { date } = req.query; // Format: YYYY-MM-DD
-    
-    const whereClause = { userId };
-    
-    if (date) {
-      whereClause.scheduledDate = date;
+    const profileId = await resolveProfileUuid(req);   // ← THIS prevents "uuid: \"39\"" errors
+    if (!profileId) return res.status(401).json({ hasError: true, message: 'unknown profile' });
+
+    const page  = Math.max(parseInt(req.query.page ?? '1', 10), 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit ?? '20', 10), 1), 100);
+    const offset = (page - 1) * limit;
+
+    const day   = req.query.day;
+    const start = req.query.start;
+    const end   = req.query.end;
+
+    const conds = ['up.user_id = $1::uuid'];
+    const params = [profileId];
+    let p = 2;
+
+    if (day && DAY_RE.test(day)) {
+      conds.push(`up.scheduled_date = $${p++}::date`);
+      params.push(day);
+    } else if (start && end && DAY_RE.test(start) && DAY_RE.test(end)) {
+      conds.push(`up.scheduled_date BETWEEN $${p++}::date AND $${p++}::date`);
+      params.push(start, end);
     }
 
-    const plans = await UserPlan.findAll({
-      where: whereClause,
-      include: [
-        {
-          model: HealthySwap,
-          as: 'swap',
-          attributes: ['id', 'category', 'unhealthyItem', 'healthyAlternative', 'imageUrl', 'benefits', 'caloriesSaved'],
-        },
-      ],
-      order: [['scheduledDate', 'ASC']],
-    });
+    const where = `WHERE ${conds.join(' AND ')}`;
 
-    res.json({
-      hasError: false,
-      data: plans,
-    });
-  } catch (error) {
-    console.error('Error fetching user plans:', error);
-    res.status(500).json({
-      hasError: true,
-      message: 'Failed to fetch user plans',
-      error: error.message,
-    });
+    const dataQ = `
+      SELECT up.id, up.user_id, up.scheduled_date, up.is_completed,
+             hs.id AS swap_id, hs.category, hs.unhealthy_item, hs.healthy_alternative,
+             hs.calories_saved, hs.image_url, hs.benefits
+        FROM user_plans up
+        JOIN healthy_swaps hs ON hs.id = up.swap_id
+       ${where}
+       ORDER BY up.scheduled_date ASC, up.id ASC
+       LIMIT ${limit} OFFSET ${offset}`;
+    const cntQ = `SELECT COUNT(*)::int AS cnt FROM user_plans up ${where}`;
+
+    const [dataRes, cntRes] = await Promise.all([
+      pool.query(dataQ, params),
+      pool.query(cntQ, params),
+    ]);
+
+    res.json({ hasError: false, meta: { page, limit, total: cntRes.rows[0].cnt }, data: dataRes.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ hasError: true, message: 'Failed to fetch user plans' });
   }
-};
+}
 
-export const updatePlanStatus = async (req, res) => {
+/** PATCH /user-plans/:planId/status  { isCompleted:boolean } */
+export async function updatePlanStatus(req, res) {
   try {
-    const { planId } = req.params;
-    const { isCompleted } = req.body;
-    const userId = req.user_id;
+    const profileId = await resolveProfileUuid(req);
+    if (!profileId) return res.status(401).json({ hasError: true, message: 'unknown profile' });
 
-    const plan = await UserPlan.findOne({
-      where: {
-        id: planId,
-        userId,
-      },
-    });
+    const planId = parseInt(req.params.planId, 10);
+    if (!Number.isInteger(planId)) return res.status(400).json({ hasError: true, message: 'invalid planId' });
 
-    if (!plan) {
-      return res.status(404).json({
-        hasError: true,
-        message: 'Plan not found',
-      });
+    const { isCompleted } = req.body || {};
+    if (typeof isCompleted !== 'boolean') {
+      return res.status(400).json({ hasError: true, message: 'isCompleted (boolean) required' });
     }
 
-    plan.isCompleted = isCompleted;
-    await plan.save();
+    const upd = await pool.query(
+      `UPDATE user_plans
+          SET is_completed = $1::boolean, updated_at = NOW()
+        WHERE id = $2::bigint AND user_id = $3::uuid
+        RETURNING id`,
+      [isCompleted, planId, profileId]
+    );
+    if (!upd.rows[0]) return res.status(404).json({ hasError: true, message: 'plan not found' });
 
-    res.json({
-      hasError: false,
-      message: 'Plan updated successfully',
-      data: plan,
-    });
-  } catch (error) {
-    console.error('Error updating plan status:', error);
-    res.status(500).json({
-      hasError: true,
-      message: 'Failed to update plan status',
-      error: error.message,
-    });
+    const { rows } = await pool.query(
+      `SELECT up.id, up.user_id, up.scheduled_date, up.is_completed,
+              hs.id AS swap_id, hs.category, hs.unhealthy_item, hs.healthy_alternative,
+              hs.calories_saved, hs.image_url, hs.benefits
+         FROM user_plans up
+         JOIN healthy_swaps hs ON hs.id = up.swap_id
+        WHERE up.id = $1::bigint`,
+      [planId]
+    );
+    res.json({ hasError: false, data: rows[0] });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ hasError: true, message: 'Failed to update plan status' });
   }
-};
+}
 
-export const removeFromPlan = async (req, res) => {
+/** DELETE /user-plans/:planId */
+export async function removeFromPlan(req, res) {
   try {
-    const { planId } = req.params;
-    const userId = req.user_id;
+    const profileId = await resolveProfileUuid(req);
+    if (!profileId) return res.status(401).json({ hasError: true, message: 'unknown profile' });
 
-    const result = await UserPlan.destroy({
-      where: {
-        id: planId,
-        userId,
-      },
-    });
+    const planId = parseInt(req.params.planId, 10);
+    if (!Number.isInteger(planId)) return res.status(400).json({ hasError: true, message: 'invalid planId' });
 
-    if (result === 0) {
-      return res.status(404).json({
-        hasError: true,
-        message: 'Plan not found or already removed',
-      });
-    }
+    const del = await pool.query(
+      `DELETE FROM user_plans
+        WHERE id = $1::bigint AND user_id = $2::uuid
+        RETURNING id`,
+      [planId, profileId]
+    );
+    if (!del.rows[0]) return res.status(404).json({ hasError: true, message: 'plan not found' });
 
-    res.json({
-      hasError: false,
-      message: 'Removed from plan successfully',
-    });
-  } catch (error) {
-    console.error('Error removing from plan:', error);
-    res.status(500).json({
-      hasError: true,
-      message: 'Failed to remove from plan',
-      error: error.message,
-    });
+    res.json({ hasError: false, message: 'removed' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ hasError: true, message: 'Failed to remove from plan' });
   }
-};
+}
